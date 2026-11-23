@@ -1,3 +1,5 @@
+![Heads Up News — Telegram AI news digest for Even Realities G2 glasses](banner.png)
+
 # Heads Up News — Telegram AI news digest for Even Realities G2
 
 Built for the **Even Realities 'Heads Up' Hackathon** (23–29 Nov 2026), **Messaging & News track**, by SIERA Labs. Also targeting the **$1,000 Best Telegram Integration** bonus.
