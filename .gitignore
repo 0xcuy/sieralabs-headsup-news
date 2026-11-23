@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.ehpk
+state.json
+telegram-bot-token
+.DS_Store
