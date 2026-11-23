@@ -206,19 +206,6 @@ async function startGlasses() {
   console.log('Page created:', result === 0 ? 'success' : `failed (${result})`)
 
   const unsubscribe = bridge.onEvenHubEvent(event => {
-    // Debug beacon: lets us see exactly which events the simulator delivers.
-    void fetch(`${API_BASE}/api/event`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        kind: event.listEvent ? 'list' : event.textEvent ? 'text' : event.sysEvent ? 'sys' : 'other',
-        listIndex: event.listEvent ? (event.listEvent.currentSelectItemIndex ?? 0) : null,
-        listName: event.listEvent?.currentSelectItemName ?? null,
-        textId: event.textEvent?.containerID ?? null,
-        sysType: event.sysEvent?.eventType ?? null,
-      }),
-    }).catch(() => {})
-
     const sysType = eventTypeOf(event.sysEvent)
     const textType = eventTypeOf(event.textEvent)
 

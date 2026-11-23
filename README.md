@@ -99,9 +99,8 @@ The app fetches its digest from the backend URL in `src/main.ts`
 - The G2 app and backend code were written with AI coding assistance
   (Muse) during the hackathon build week; the starter template is the
   official Even Hub minimal template (`@evenrealities/evenhub-cli`).
-- The `POST /api/event` endpoint and the small beacon in `src/main.ts`
-  are debug scaffolding from simulator testing; they only log event kinds
-  to our own backend and will be removed before final submission.
+- A debug event beacon (`POST /api/event`) was used during simulator testing
+  and removed before submission.
 
 ## Known limitations (Day 1)
 

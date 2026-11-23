@@ -244,16 +244,6 @@ const server = createServer(async (req, res) => {
     })
     return
   }
-  if (url.pathname === '/api/event' && req.method === 'POST') {
-    let body = ''
-    req.on('data', c => (body += c))
-    req.on('end', () => {
-      try { console.log('[event]', body.slice(0, 300)) } catch { /* ignore */ }
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true }))
-    })
-    return
-  }
   if (url.pathname === '/api/refresh' && req.method === 'POST') {
     refreshDigest('manual').then(ok => {
       res.writeHead(200, { 'content-type': 'application/json' })
