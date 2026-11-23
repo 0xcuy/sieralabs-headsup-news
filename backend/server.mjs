@@ -6,6 +6,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { randomUUID } from 'node:crypto'
 
 const PORT = Number(process.env.PORT || 8787)
 const STATE_DIR = process.env.STATE_DIR || '/root/headsup'
@@ -14,6 +15,25 @@ const BOT_TOKEN_FILE = process.env.BOT_TOKEN_FILE || '/root/headsup/telegram-bot
 const OG_KEY_FILE = '/root/.config/0g-router/api-key'
 const OG_API_URL = 'https://router-api.0g.ai/v1/chat/completions'
 const OG_MODEL = 'glm-5.3-flash'
+// Voice: speech-to-text runs through Deepgram, but the Deepgram credential
+// lives on the Muse VM (custom.deepgram, via authd surrogates) and the
+// surrogate is only substituted on VM egress — the droplet CANNOT call
+// Deepgram itself, and no key (raw or surrogate) may ever be written to the
+// droplet, an env var, or this file. So /api/voice is an ASYNC JOB QUEUE:
+// the glasses POST audio, a poller on the VM picks the job up, calls
+// Deepgram from the VM, and POSTs the transcript back here. The app polls
+// GET /api/voice/:jobId for the result. See voice-poller/deepgram_poller.py.
+// The poller's GET /api/voice-jobs doubles as its heartbeat: if it hasn't
+// checked in for 20s, /api/voice fails fast (503) instead of hanging.
+const MAX_VOICE_BYTES = 1024 * 1024 // ~30s of 16kHz 16-bit mono PCM; clips are ~4s
+const VOICE_JOB_TTL_MS = 90 * 1000
+const VOICE_POLLER_STALE_MS = 20 * 1000
+const voiceJobs = new Map() // jobId -> { audio, mime, status, transcript, command, error, createdAt }
+let lastVoicePollAt = 0
+setInterval(() => {
+  const now = Date.now()
+  for (const [id, job] of voiceJobs) if (now - job.createdAt > VOICE_JOB_TTL_MS) voiceJobs.delete(id)
+}, 60 * 1000)
 
 const FEEDS = [
   { source: 'BBC', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
@@ -208,6 +228,46 @@ async function pollLoop() {
   }
 }
 
+// ---------- Voice: STT + command parse (POST /api/voice) ----------
+// The G2 app sends a short WAV (16kHz 16-bit mono PCM from the glasses mic,
+// wrapped in a WAV header by the app) or multipart form-data with a `file`
+// part (browser preview sends MediaRecorder webm the same way). We forward
+// the bytes to Whisper on the 0G router and map the transcript to one of
+// three commands. The app owns the action itself (it holds the story index);
+// the backend only returns { transcript, command }.
+function parseVoiceCommand(text) {
+  const t = (text || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ')
+  const has = w => new RegExp(`\\b${w}\\b`).test(t)
+  if (has('save')) return 'save' // "save", "save this", "save this story"
+  if (has('next')) return 'next' // "next", "next story"
+  if (has('repeat') || has('again')) return 'repeat' // "repeat", "say it again"
+  return null
+}
+
+// Pull the audio bytes out of a multipart/form-data body (part named `file`);
+// a non-multipart body is treated as raw audio bytes as-is.
+function extractAudio(req, body) {
+  const ct = req.headers['content-type'] || ''
+  const m = ct.match(/multipart\/form-data;\s*boundary=(?:"([^"]+)"|([^;]+))/i)
+  if (!m) return { bytes: body, filename: 'clip.wav', mime: ct.split(';')[0] || 'audio/wav' }
+  const boundary = Buffer.from('--' + (m[1] || m[2]).trim())
+  let pos = body.indexOf(boundary)
+  while (pos !== -1) {
+    const headEnd = body.indexOf('\r\n\r\n', pos)
+    if (headEnd === -1) break
+    const head = body.subarray(pos, headEnd).toString('latin1')
+    const next = body.indexOf(boundary, headEnd)
+    if (next === -1) break
+    if (/name="file"/.test(head)) {
+      const fn = head.match(/filename="([^"]*)"/)
+      const mt = head.match(/Content-Type:\s*([^\r\n]+)/i)
+      return { bytes: body.subarray(headEnd + 4, next - 2), filename: fn?.[1] || 'clip.wav', mime: (mt?.[1] || 'audio/wav').trim() }
+    }
+    pos = next
+  }
+  return { bytes: null, filename: '', mime: '' }
+}
+
 // ---------- HTTP API for the G2 app ----------
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
@@ -243,6 +303,86 @@ const server = createServer(async (req, res) => {
       }
     })
     return
+  }
+  // Voice jobs (async — transcription runs in the VM poller, see header).
+  // POST /api/voice: enqueue a clip, returns 202 { jobId }.
+  if (url.pathname === '/api/voice' && req.method === 'POST') {
+    if (Date.now() - lastVoicePollAt > VOICE_POLLER_STALE_MS) {
+      res.writeHead(503, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ ok: false, error: 'voice_unavailable', detail: 'voice relay has not checked in' }))
+    }
+    const chunks = []
+    let size = 0
+    let tooBig = false
+    req.on('data', c => {
+      size += c.length
+      if (size > MAX_VOICE_BYTES) { tooBig = true; return }
+      chunks.push(c)
+    })
+    req.on('end', () => {
+      if (tooBig) { res.writeHead(413, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'audio_too_large' })) }
+      const { bytes, filename, mime } = extractAudio(req, Buffer.concat(chunks))
+      if (!bytes || bytes.length < 100) { res.writeHead(400, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'no_audio' })) }
+      const jobId = randomUUID()
+      voiceJobs.set(jobId, { audio: bytes, mime: mime || 'audio/wav', status: 'pending', transcript: '', command: null, error: '', createdAt: Date.now() })
+      console.log(`[voice] job ${jobId} queued (${bytes.length} bytes ${mime || 'audio/wav'})`)
+      res.writeHead(202, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, jobId }))
+    })
+    return
+  }
+  // GET /api/voice-jobs: poller claim list (also the poller heartbeat).
+  if (url.pathname === '/api/voice-jobs' && req.method === 'GET') {
+    lastVoicePollAt = Date.now()
+    const jobs = [...voiceJobs.entries()]
+      .filter(([, j]) => j.status === 'pending')
+      .map(([jobId, j]) => ({ jobId, mime: j.mime, createdAt: j.createdAt }))
+    res.writeHead(200, { 'content-type': 'application/json' })
+    return res.end(JSON.stringify({ ok: true, jobs }))
+  }
+  // GET /api/voice/:jobId/audio: poller downloads the clip (id is a UUID).
+  const audioMatch = url.pathname.match(/^\/api\/voice\/([0-9a-f-]{36})\/audio$/)
+  if (audioMatch && req.method === 'GET') {
+    const job = voiceJobs.get(audioMatch[1])
+    if (!job) { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'job_not_found' })) }
+    res.writeHead(200, { 'content-type': job.mime || 'audio/wav' })
+    return res.end(job.audio)
+  }
+  // POST /api/voice-result: poller delivers { jobId, transcript } or { jobId, error }.
+  if (url.pathname === '/api/voice-result' && req.method === 'POST') {
+    let body = ''
+    req.on('data', c => (body += c))
+    req.on('end', () => {
+      try {
+        const { jobId, transcript, error } = JSON.parse(body || '{}')
+        const job = voiceJobs.get(jobId)
+        if (!job) { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'job_not_found' })) }
+        if (error) {
+          job.status = 'error'; job.error = String(error).slice(0, 120)
+          console.log(`[voice] job ${jobId} error: ${job.error}`)
+        } else {
+          job.status = 'done'
+          job.transcript = String(transcript || '').trim()
+          job.command = parseVoiceCommand(job.transcript)
+          job.audio = null // free the clip; the result is all the app needs
+          console.log(`[voice] job ${jobId} "${job.transcript}" -> ${job.command || '(no match)'}`)
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      } catch (e) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: e.message }))
+      }
+    })
+    return
+  }
+  // GET /api/voice/:jobId: app polls for the result.
+  const jobMatch = url.pathname.match(/^\/api\/voice\/([0-9a-f-]{36})$/)
+  if (jobMatch && req.method === 'GET') {
+    const job = voiceJobs.get(jobMatch[1])
+    if (!job) { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'job_not_found' })) }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    return res.end(JSON.stringify({ ok: true, status: job.status, transcript: job.transcript, command: job.command, error: job.error }))
   }
   if (url.pathname === '/api/refresh' && req.method === 'POST') {
     refreshDigest('manual').then(ok => {
