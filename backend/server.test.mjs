@@ -62,6 +62,8 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   ]
   const feedHosts = ['feeds.bbci.co.uk', 'www.theguardian.com', 'www.aljazeera.com', 'www.theverge.com']
   const sent = []
+  const summary = 'A [draft and an _underscore appear.'
+  let rejectDelivery = false
   let translations = 0
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     const host = new URL(url).hostname
@@ -71,7 +73,7 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
     }
     if (host === 'router-api.0g.ai') {
       const prompt = JSON.parse(options.body).messages[0].content
-      let rows = [{ candidate: 2, headline: 'Other news', category: 'SCIENCE' }, { candidate: 3, headline: 'Local news', category: 'WORLD' }]
+      let rows = [{ candidate: 2, headline: 'Other news', summary, category: 'SCIENCE' }, { candidate: 3, headline: 'Local news', category: 'WORLD' }]
       if (prompt.startsWith('Translate')) {
         translations++
         rows = JSON.parse(prompt.split('\n').at(-1)).map(row => ({ ...row, headline: `ID ${row.headline}` }))
@@ -80,6 +82,7 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
     }
     assert.equal(host, 'api.telegram.org')
     sent.push(JSON.parse(options.body))
+    if (rejectDelivery) return Response.json({ ok: false, description: 'Bad Request: delivery rejected' }, { status: 400 })
     return Response.json({ ok: true })
   })
   server.listen(0, '127.0.0.1')
@@ -103,6 +106,18 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assert.equal(global.stories[0].source, 'BBC')
   assert.equal(global.stories[1].headline, 'Other news')
   assert.deepEqual(await digests(device), global)
+  const assertPlainDigest = (digest, title, updatedLabel) => {
+    const delivery = sent.at(-1)
+    assert.equal(Object.hasOwn(delivery, 'parse_mode'), false)
+    const [header, ...sections] = delivery.text.split('\n\n')
+    assert.equal(header.split('\n')[0], `📰 Heads Up — ${title}`)
+    assert.match(header.split('\n')[1], new RegExp(`^${updatedLabel} .+ WIB$`))
+    assert.deepEqual(sections, digest.stories.map((s, i) =>
+      [`${i + 1}. ${s.headline}`, s.summary, s.source, s.url].filter(Boolean).join('\n')))
+    assert.ok(delivery.text.includes(summary))
+  }
+  await bot(1, '/digest')
+  assertPlainDigest(global, 'News Digest', 'Updated')
   const start = await api('/api/pair/start', { device })
   const { code } = await start.json()
   assert.match(code, /^\d{4}$/)
@@ -114,6 +129,7 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   await bot(2, '/digest')
   assert.match(sent.at(-1).text, /Ringkasan Berita/)
   const personalized = await digests(device)
+  assertPlainDigest(personalized, 'Ringkasan Berita', 'Diperbarui')
   assert.equal(personalized.lang, 'id')
   assert.deepEqual(personalized.stories.map(s => s.headline), [`ID ${lead.title}`, 'ID Local news', 'ID Other news'])
   assert.equal(translations, 1)
@@ -123,6 +139,13 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assert.equal((await api('/api/save', { storyId: global.stories[0].id, device: randomUUID() })).status, 409)
   await bot(2, '/sources')
   assert.match(sent.at(-1).text, /BBC: .*\nGuardian: .*\nAl Jazeera: .*\nThe Verge:/)
+  const logError = t.mock.method(console, 'error', () => {})
+  rejectDelivery = true
+  await bot(2, '/digest')
+  assert.deepEqual(logError.mock.calls.map(call => call.arguments), [
+    ['[tg] send failed', 2, 'Bad Request: delivery rejected'],
+  ])
+  assert.ok(sent.every(message => !Object.hasOwn(message, 'parse_mode')))
   const state = JSON.parse(await readFile(join(process.env.STATE_DIR, 'state.json'), 'utf8'))
   assert.equal(state.alerts.length, 1)
   assert.equal(state.devices[device], 2)

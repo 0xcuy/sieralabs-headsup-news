@@ -321,13 +321,14 @@ export function createPairing(now = Date.now, nextCode = () => String(randomInt(
 }
 const pairing = createPairing()
 
+async function sendToChat(chatId, text) {
+  try {
+    const r = await tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true })
+    if (!r.ok) console.error('[tg] send failed', chatId, r.description)
+  } catch (e) { console.error('[tg] send error', chatId, e.message) }
+}
 async function sendToChats(text, chats = state.chats) {
-  for (const chatId of chats) {
-    try {
-      const r = await tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true })
-      if (!r.ok) console.error('[tg] send failed', chatId, r.description)
-    } catch (e) { console.error('[tg] send error', e.message) }
-  }
+  for (const chatId of chats) await sendToChat(chatId, text)
 }
 export async function handleUpdate(u) {
   const msg = u.message
@@ -336,7 +337,7 @@ export async function handleUpdate(u) {
   const [target, ...args] = msg.text.trim().split(/\s+/)
   const [command, username] = target.toLowerCase().split('@')
   if (username && username !== 'headsupnewsbot') return
-  const reply = text => tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true })
+  const reply = text => sendToChat(chatId, text)
   const value = args.join(' ').toLowerCase()
   function setPreference(key, value) {
     state.preferences[chatId] = { ...state.preferences[chatId], [key]: value }
