@@ -196,16 +196,11 @@ function buildDigest(candidates, rewritten, breaking) {
     if (s && Number.isInteger(s.candidate) && candidates[s.candidate - 1] && !selections.has(s.candidate)) selections.set(s.candidate, s)
   }
   const order = [...new Set([...(breaking ? [1] : []), ...selections.keys(), ...candidates.map((_, i) => i + 1)])]
-  const ids = new Set()
-  return order.slice(0, MAX_STORIES).map((key, i) => {
+  return order.slice(0, MAX_STORIES).map(key => {
     const c = candidates[key - 1], s = selections.get(key)
-    // Stable per article so ids shown on the glasses survive refreshes.
-    const base = `s${createHash('sha256').update(c.url).digest('hex').slice(0, 12)}`
-    const id = ids.has(base) ? `${base}-${i}` : base
-    ids.add(id)
     return {
-      id,
-
+      // Stable per article (candidates are unique by url) so ids shown on the glasses survive refreshes.
+      id: `s${createHash('sha256').update(c.url).digest('hex').slice(0, 12)}`,
       headline: limitText(s?.headline, 10, 120) || limitText(c.title, 10, 120),
       summary: limitText(s?.summary, 18, 220),
       category: CATEGORIES.includes(s?.category) ? s.category : c.source === 'The Verge' ? 'TECH' : 'WORLD',
@@ -236,7 +231,7 @@ async function runRefresh(reason) {
   const seen = new Set()
   const candidates = [...(breaking ? [breaking] : []), ...all
     .filter(c => !breaking || (c !== breaking && c.url !== breaking.url && !sameStory(c, breaking)))
-    .filter(c => { const k = c.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40); if (seen.has(k)) return false; seen.add(k); return true })
+    .filter(c => { const k = c.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40); if (seen.has(k) || seen.has(c.url)) return false; seen.add(k).add(c.url); return true })
     .sort((a, b) => publicationTime(b) - publicationTime(a))].slice(0, 14)
   if (candidates.length === 0) { console.error('[digest] no RSS items at all'); return false }
   try {
