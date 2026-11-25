@@ -37,6 +37,26 @@ important stories and rewrite each to a ≤10-word headline and a ≤18-word
 summary. If the model call fails, the backend shows shortened RSS
 headlines with source links, without copying descriptions into summaries.
 
+## Architecture
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
+  <img alt="Heads Up News architecture. Users: a Telegram user in their own chat with the bot, and a G2 glasses wearer using ring + tap, voice and save to Telegram. Run by SIERA: the G2 app (g2-app/src/main.ts, on the glasses, Even Hub SDK) calls headsup.sieralabs.com over HTTPS for /api/digest, /api/save and /api/voice; Traefik on the SIERA VPS terminates TLS and routes over Tailscale to port 8787 on the 32GB droplet; the Telegram bot backend (backend/server.mjs, Node 22 or later, zero npm dependencies, state in state.json) runs there; the voice poller (voice-poller/deepgram_poller.py) runs on the Muse VM, holds the Deepgram credential, polls the droplet directly on port 8787 for voice jobs and posts transcripts back. Third-party services: the Telegram Bot API (getUpdates long polling, sendMessage as plain text), which Telegram users reach with /digest, /saved and /pair CODE; the RSS feeds of BBC World, The Guardian World, Al Jazeera and The Verge, read every 30 minutes; the 0G Compute router with glm-5.3-flash for the digest and Indonesian translation; and Deepgram nova-2 speech to text, whose stored key is currently rejected with INVALID_AUTH. Planned hardening, not built yet: pair the glasses (device id, /api/pair/start code, ?device=), a shared secret for the voice relay, atomic state writes with state.json.bak, and a paired device for /api/save plus a rate limit on /api/refresh." src="docs/architecture-light.png">
+</picture>
+
+The diagram shows what runs today; the four amber cards are planned and
+not built yet. It is rendered from HTML by
+[`docs/diagram/render.mjs`](docs/diagram/render.mjs) (Playwright, Inter,
+Lucide icons), which checks the layout and text contrast before it writes
+the PNGs. To regenerate it:
+
+```bash
+cd docs/diagram && npm install && npx playwright install chromium && npm run render
+```
+
+The diagram's dependencies live only in `docs/diagram/`; the backend
+stays dependency-free.
+
 ## Telegram commands
 
 | Command | What it does |
