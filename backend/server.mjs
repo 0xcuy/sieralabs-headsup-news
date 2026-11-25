@@ -6,7 +6,8 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { createServer } from 'node:http'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, randomInt } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
 
 const PORT = Number(process.env.PORT || 8787)
 const STATE_DIR = process.env.STATE_DIR || '/root/headsup'
@@ -30,10 +31,6 @@ const VOICE_JOB_TTL_MS = 90 * 1000
 const VOICE_POLLER_STALE_MS = 20 * 1000
 const voiceJobs = new Map() // jobId -> { audio, mime, status, transcript, command, error, createdAt }
 let lastVoicePollAt = 0
-setInterval(() => {
-  const now = Date.now()
-  for (const [id, job] of voiceJobs) if (now - job.createdAt > VOICE_JOB_TTL_MS) voiceJobs.delete(id)
-}, 60 * 1000)
 
 const FEEDS = [
   { source: 'BBC', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
@@ -41,22 +38,34 @@ const FEEDS = [
   { source: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml' },
   { source: 'The Verge', url: 'https://www.theverge.com/rss/index.xml' },
 ]
+const HELP = [
+  '/start — link this chat',
+  '/digest — show your latest digest',
+  '/alerts on|off — toggle breaking-news alerts',
+  '/topics — set priority categories (or all)',
+  '/lang en|id — set digest language',
+  '/place world|Indonesia — set geographic priority',
+  '/pair CODE — link your glasses in this private chat',
+  '/sources — list news feeds',
+].join('\n')
 
 const MAX_STORIES = 8
 const REFRESH_MS = 30 * 60 * 1000
+const ALERT_COOLDOWN_MS = 60 * 60 * 1000
+const BREAKING_MAX_AGE_MS = 2 * ALERT_COOLDOWN_MS
+const ALERT_HISTORY_MS = 2 * 24 * ALERT_COOLDOWN_MS
+const CATEGORIES = ['WORLD', 'TECH', 'BUSINESS', 'SPORT', 'SCIENCE', 'CULTURE']
+const DEFAULT_PREFERENCES = { topics: [], lang: 'en', place: 'world', alerts: true }
+const INDONESIA = /\b(?:indonesia(?:n)?|jakarta|bali|surabaya|yogyakarta|bandung|sulawesi|sumatra|jokowi|prabowo)\b/i
+const PAIR_TTL_MS = 10 * 60 * 1000
+const DEVICE_ID = /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i
 
-mkdirSync(STATE_DIR, { recursive: true })
-
-let state = { digest: null, updatedAt: null, chats: [], saved: [] }
-if (existsSync(STATE_FILE)) {
-  try { state = { ...state, ...JSON.parse(readFileSync(STATE_FILE, 'utf8')) } } catch { /* corrupt state: start fresh */ }
-}
+let state = { digest: null, updatedAt: null, chats: [], saved: [], preferences: {}, devices: {}, alerts: [] }
 function persist() {
   try { writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)) } catch (e) { console.error('[state] write failed', e.message) }
 }
 
-const botToken = readFileSync(BOT_TOKEN_FILE, 'utf8').trim()
-const ogKey = readFileSync(OG_KEY_FILE, 'utf8').trim()
+let botToken, ogKey
 const tg = (method, body) =>
   fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
     method: 'POST',
@@ -101,15 +110,12 @@ async function fetchFeed(feed) {
 }
 
 // ---------- AI digest via GLM on 0G router ----------
-async function summarize(candidates) {
-  const list = candidates.map((c, i) =>
-    `${i + 1}. [${c.source}] ${c.title} — ${c.description.slice(0, 220)} (${c.published || 'no date'}) <${c.url}>`).join('\n')
-  const prompt = `You are the editor of a glanceable news digest for smart glasses. Pick the ${MAX_STORIES} most important, distinct stories from this list and rewrite each for a 1-second glance on a tiny display. Rules: headline max 10 words, plain and factual; summary max 18 words, one sentence, no hype; category one of WORLD, TECH, BUSINESS, SPORT, SCIENCE, CULTURE; keep the original source name and URL. Reply with ONLY a JSON array: [{"headline": "...", "summary": "...", "category": "...", "source": "...", "url": "...", "published": "..."}].\n\n${list}`
+async function askModel(prompt, timeout = 180000) {
   const res = await fetch(OG_API_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${ogKey}` },
     body: JSON.stringify({ model: OG_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 4000, reasoning_effort: 'low' }),
-    signal: AbortSignal.timeout(180000),
+    signal: AbortSignal.timeout(timeout),
   })
   const raw = await res.text()
   if (!res.ok) throw new Error(`0G router HTTP ${res.status}: ${raw.slice(0, 200)}`)
@@ -129,87 +135,247 @@ async function summarize(candidates) {
     throw new Error(`model JSON unparseable: ${e.message} (head: ${text.slice(0, 120)})`)
   }
   if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('empty digest from model')
-  return parsed.slice(0, MAX_STORIES).map((s, i) => ({
-    id: `s${Date.now().toString(36)}-${i}`,
-    headline: String(s.headline || '').slice(0, 120),
-    summary: String(s.summary || '').slice(0, 220),
-    category: String(s.category || 'WORLD').toUpperCase().slice(0, 12),
-    source: String(s.source || ''),
-    url: String(s.url || ''),
-    published: String(s.published || ''),
-  }))
+  return parsed
 }
 
-function fallbackDigest(candidates) {
-  return candidates.slice(0, MAX_STORIES).map((c, i) => ({
-    id: `s${Date.now().toString(36)}-${i}`,
-    headline: c.title.slice(0, 120),
-    summary: c.description.slice(0, 200) || c.title,
-    category: 'WORLD',
-    source: c.source,
-    url: c.url,
-    published: c.published,
-  }))
+const STOP_WORDS = new Set('about after also amid and are been before breaking but could first for from has have into latest live more new now over says than that the their this under urgent was were what when where which who will with would'.split(' '))
+function titleWords(title) {
+  return new Set((title.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter(w => w.length >= 3 && !STOP_WORDS.has(w)))
+}
+function sameStory(a, b) {
+  const aw = titleWords(a.title), bw = titleWords(b.title)
+  const overlap = [...aw].filter(word => bw.has(word)).length
+  return overlap >= 4 && overlap / new Set([...aw, ...bw]).size >= 0.65
+}
+function publicationTime(candidate) {
+  return Date.parse(candidate.published) || 0
+}
+export function detectBreaking(items, now = Date.now()) {
+  const recent = items.filter(c => {
+    const age = now - publicationTime(c)
+    return age >= 0 && age <= BREAKING_MAX_AGE_MS
+  }).sort((a, b) => publicationTime(b) - publicationTime(a))
+  return recent.find((c, i) =>
+    /^(?:\[\s*(?:breaking(?:\s+news)?|urgent)\s*\]|breaking news\b|(?:breaking|urgent)\s*[:–—!-])/i.test(c.title) ||
+    recent.some((other, j) => i !== j && c.source !== other.source && sameStory(c, other))
+  )
+}
+export function shouldAlert(candidate, history, now = Date.now()) {
+  return !history.some(alert => now - alert.at < ALERT_COOLDOWN_MS ||
+    (now - alert.at < ALERT_HISTORY_MS && (alert.url === candidate.url || sameStory(alert, candidate))))
+}
+function limitText(text, words, chars) {
+  return typeof text === 'string' ? text.trim().split(/\s+/).slice(0, words).join(' ').slice(0, chars) : ''
+}
+function buildDigest(candidates, rewritten, breaking) {
+  const selections = new Map()
+  for (const s of rewritten) {
+    if (s && Number.isInteger(s.candidate) && candidates[s.candidate - 1] && !selections.has(s.candidate)) selections.set(s.candidate, s)
+  }
+  const order = [...new Set([...(breaking ? [1] : []), ...selections.keys(), ...candidates.map((_, i) => i + 1)])]
+  const stamp = Date.now().toString(36)
+  return order.slice(0, MAX_STORIES).map((key, i) => {
+    const c = candidates[key - 1], s = selections.get(key)
+    return {
+      id: `s${stamp}-${i}`,
+      headline: limitText(s?.headline, 10, 120) || limitText(c.title, 10, 120),
+      summary: limitText(s?.summary, 18, 220),
+      category: CATEGORIES.includes(s?.category) ? s.category : c.source === 'The Verge' ? 'TECH' : 'WORLD',
+      source: c.source,
+      url: c.url,
+      published: c.published,
+      indonesia: INDONESIA.test(`${c.title} ${c.description}`),
+      ...(breaking && key === 1 ? { breaking: true } : {}),
+    }
+  })
+}
+async function summarize(candidates, breaking) {
+  const list = candidates.map((c, i) =>
+    `${i + 1}. [${c.source}] ${c.title} — ${c.description.slice(0, 220)} (${c.published || 'no date'})`).join('\n')
+  const prompt = `You are the editor of a glanceable news digest for smart glasses. Pick up to ${MAX_STORIES} important, distinct stories from this list.${breaking ? ' Always include candidate 1 first; it is breaking news.' : ''} Rewrite each for a 1-second glance on a tiny display. Headline max 10 words, plain and factual; summary max 18 words, one sentence, no hype; category one of ${CATEGORIES.join(', ')}. Reply with ONLY a JSON array: [{"candidate": 1, "headline": "...", "summary": "...", "category": "..."}]. The candidate number must match the original list.\n\n${list}`
+  return buildDigest(candidates, await askModel(prompt), breaking)
 }
 
-async function refreshDigest(reason) {
+let refreshInProgress
+function refreshDigest(reason) {
+  refreshInProgress ??= runRefresh(reason).finally(() => { refreshInProgress = undefined })
+  return refreshInProgress
+}
+async function runRefresh(reason) {
   console.log(`[digest] refresh (${reason})`)
   const all = (await Promise.all(FEEDS.map(fetchFeed))).flat()
+  const breaking = detectBreaking(all)
   const seen = new Set()
-  const candidates = all
+  const candidates = [...(breaking ? [breaking] : []), ...all
+    .filter(c => !breaking || (c !== breaking && c.url !== breaking.url && !sameStory(c, breaking)))
     .filter(c => { const k = c.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40); if (seen.has(k)) return false; seen.add(k); return true })
-    .sort((a, b) => new Date(b.published || 0) - new Date(a.published || 0))
-    .slice(0, 14)
+    .sort((a, b) => publicationTime(b) - publicationTime(a))].slice(0, 14)
   if (candidates.length === 0) { console.error('[digest] no RSS items at all'); return false }
   try {
-    state.digest = await summarize(candidates)
+    state.digest = await summarize(candidates, breaking)
     console.log(`[digest] AI digest ready: ${state.digest.length} stories`)
   } catch (e) {
     console.error('[digest] GLM attempt 1 failed:', e.message, '— retrying once')
     try {
-      state.digest = await summarize(candidates)
+      state.digest = await summarize(candidates, breaking)
       console.log(`[digest] AI digest ready on retry: ${state.digest.length} stories`)
     } catch (e2) {
       console.error('[digest] GLM retry failed, using raw fallback:', e2.message)
-      state.digest = fallbackDigest(candidates)
+      state.digest = buildDigest(candidates, [], breaking)
     }
   }
   state.updatedAt = new Date().toISOString()
-  persist()
+  const now = Date.now()
+  state.alerts = state.alerts.filter(alert => now - alert.at < ALERT_HISTORY_MS)
+  const recipients = state.chats.filter(id => state.preferences[id]?.alerts !== false)
+  if (breaking && recipients.length && shouldAlert(breaking, state.alerts, now)) {
+    state.alerts.push({ title: breaking.title, url: breaking.url, at: now })
+    persist()
+    const lead = state.digest[0]
+    void sendToChats(`🚨 Breaking news\n${lead.headline}\n${lead.source}: ${lead.url}`, recipients)
+  } else {
+    persist()
+  }
   return true
 }
 
 // ---------- Telegram bot ----------
-function digestMessage() {
-  if (!state.digest) return 'No digest yet — try again in a minute.'
-  const lines = state.digest.map((s, i) => `${i + 1}. *${s.headline}*\n${s.summary}\n_${s.source}${s.published ? ' · ' + s.published : ''}_\n${s.url}`)
-  return `📰 *Heads Up — News Digest*\nUpdated ${new Date(state.updatedAt).toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' })} WIB\n\n${lines.join('\n\n')}`
+export function rankDigest(stories, prefs) {
+  const score = s => (s.breaking ? 4 : 0) +
+    (prefs.place === 'indonesia' && (s.indonesia ?? INDONESIA.test(`${s.headline} ${s.summary}`)) ? 2 : 0) +
+    (prefs.topics.includes(s.category) ? 1 : 0)
+  return [...stories].sort((a, b) => score(b) - score(a))
 }
-async function sendToChats(text, parseMode) {
-  for (const chatId of state.chats) {
+let translationCache
+function translateDigest(stories) {
+  if (translationCache?.stories !== stories) {
+    const list = stories.map((s, i) => ({ candidate: i + 1, headline: s.headline, summary: s.summary }))
+    const prompt = `Translate each headline and summary into Bahasa Indonesia. Max 10 headline words and 18 summary words. Keep the facts; use an empty summary if the original is empty. Return only a JSON array with candidate, headline, and summary for each entry.\n${JSON.stringify(list)}`
+    const promise = askModel(prompt, 20000).then(rows => {
+      const byNumber = new Map(rows.filter(Boolean).map(s => [s.candidate, s]))
+      return stories.map((story, i) => {
+        const row = byNumber.get(i + 1)
+        const headline = limitText(row?.headline, 10, 120), summary = limitText(row?.summary, 18, 220)
+        if (!headline || (story.summary && !summary)) throw new Error('incomplete Indonesian translation')
+        return { ...story, headline, summary: story.summary ? summary : '' }
+      })
+    }).catch(e => {
+      console.error('[digest] Indonesian translation failed:', e.message)
+      if (translationCache?.stories === stories) translationCache = undefined
+      return null
+    })
+    translationCache = { stories, promise }
+  }
+  return translationCache.promise
+}
+async function personalDigest(chatId) {
+  const { digest, updatedAt } = state
+  const { lang, ...prefs } = { ...DEFAULT_PREFERENCES, ...state.preferences[chatId] }
+  const translated = lang === 'id' && digest?.length ? await translateDigest(digest) : null
+  const stories = rankDigest(translated || digest || [], prefs)
+  return { updatedAt, stories, lang: translated ? 'id' : 'en', ...(lang === 'id' && !translated && stories.length ? { translationUnavailable: true } : {}) }
+}
+function digestMessage({ stories, updatedAt, lang, translationUnavailable }) {
+  if (!stories.length) return 'No digest yet — try again in a minute.'
+  const lines = stories.map((s, i) => [`${i + 1}. ${s.headline}`, s.summary, s.source, s.url].filter(Boolean).join('\n'))
+  const date = new Date(updatedAt).toLocaleString(lang === 'id' ? 'id-ID' : 'en-GB', { timeZone: 'Asia/Jakarta' })
+  return `📰 Heads Up — ${lang === 'id' ? 'Ringkasan Berita' : 'News Digest'}\n${lang === 'id' ? 'Diperbarui' : 'Updated'} ${date} WIB${translationUnavailable ? '\nIndonesian translation unavailable; showing English.' : ''}\n\n${lines.join('\n\n')}`
+}
+
+export function createPairing(now = Date.now, nextCode = () => String(randomInt(10000)).padStart(4, '0')) {
+  const pending = new Map()
+  let misses = []
+  const chatMisses = new Map()
+  function prune(time) {
+    for (const [code, request] of pending) if (request.expiresAt <= time) pending.delete(code)
+    for (const [id, attempts] of chatMisses) if (attempts.at(-1) <= time - PAIR_TTL_MS) chatMisses.delete(id)
+    misses = misses.filter(at => at > time - PAIR_TTL_MS)
+  }
+  return {
+    start(device) {
+      const time = now()
+      prune(time)
+      for (const [code, request] of pending) if (request.device === device) return { code, expiresAt: request.expiresAt }
+      if (pending.size >= 20) return null
+      let code
+      do { code = nextCode() } while (pending.has(code))
+      const expiresAt = time + PAIR_TTL_MS
+      pending.set(code, { device, expiresAt })
+      return { code, expiresAt }
+    },
+    claim(code, chatId) {
+      const time = now()
+      prune(time)
+      const attempts = (chatMisses.get(chatId) || []).filter(at => at > time - PAIR_TTL_MS)
+      if (misses.length >= 20 || attempts.length >= 5) return { error: 'too_many_attempts' }
+      const request = pending.get(code)
+      if (!request) {
+        misses.push(time)
+        chatMisses.set(chatId, [...attempts, time])
+        return { error: 'invalid_code' }
+      }
+      pending.delete(code)
+      return { device: request.device }
+    },
+  }
+}
+const pairing = createPairing()
+
+async function sendToChats(text, chats = state.chats) {
+  for (const chatId of chats) {
     try {
-      const r = await tg('sendMessage', { chat_id: chatId, text, parse_mode: parseMode, disable_web_page_preview: true })
+      const r = await tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true })
       if (!r.ok) console.error('[tg] send failed', chatId, r.description)
     } catch (e) { console.error('[tg] send error', e.message) }
   }
 }
-async function handleUpdate(u) {
+export async function handleUpdate(u) {
   const msg = u.message
   if (!msg || !msg.text) return
   const chatId = msg.chat.id
-  const text = msg.text.trim()
-  if (text.startsWith('/start')) {
+  const [target, ...args] = msg.text.trim().split(/\s+/)
+  const [command, username] = target.toLowerCase().split('@')
+  if (username && username !== 'headsupnewsbot') return
+  const reply = text => tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true })
+  const value = args.join(' ').toLowerCase()
+  function setPreference(key, value) {
+    state.preferences[chatId] = { ...state.preferences[chatId], [key]: value }
+    persist()
+  }
+  if (command === '/start') {
     if (!state.chats.includes(chatId)) { state.chats.push(chatId); persist() }
-    await tg('sendMessage', {
-      chat_id: chatId,
-      text: '👋 *Heads Up News* — your AI news digest for Even Realities G2 glasses.\n\nI send a short digest of the day\'s most important stories, and anything you save on your glasses lands here.\n\nCommands:\n/digest — latest digest now\n/start — link this chat (needed for saving from glasses)',
-      parse_mode: 'Markdown',
-    })
+    await reply('👋 Heads Up News — your AI news digest for Even Realities G2 glasses.\n\nUse /digest for news, /pair to link your glasses, or /help for all commands.')
     console.log(`[tg] /start from chat ${chatId} (linked chats: ${state.chats.length})`)
-  } else if (text.startsWith('/digest')) {
-    await tg('sendMessage', { chat_id: chatId, text: digestMessage(), parse_mode: 'Markdown', disable_web_page_preview: true })
-  } else if (text.startsWith('/help')) {
-    await tg('sendMessage', { chat_id: chatId, text: 'Commands: /digest — latest AI news digest. /start — link this chat so glasses saves arrive here.' })
+  } else if (command === '/digest') {
+    await reply(digestMessage(await personalDigest(chatId)))
+  } else if (command === '/alerts') {
+    if (value === 'on' || value === 'off') setPreference('alerts', value === 'on')
+    await reply(`Breaking alerts are ${state.preferences[chatId]?.alerts !== false ? 'on' : 'off'}. Use /alerts on or /alerts off.`)
+  } else if (command === '/topics') {
+    const topics = [...new Set(value.toUpperCase().split(/[\s,]+/).filter(Boolean))]
+    if (value === 'all') setPreference('topics', [])
+    else if (topics.length && topics.every(topic => CATEGORIES.includes(topic))) setPreference('topics', topics)
+    await reply(`Priority topics: ${(state.preferences[chatId]?.topics || []).join(', ') || 'all'}. Use /topics followed by any of: ${CATEGORIES.join(', ')}. Use /topics all to reset.`)
+  } else if (command === '/lang') {
+    if (value === 'en' || value === 'id') setPreference('lang', value)
+    await reply(`Digest language: ${state.preferences[chatId]?.lang || DEFAULT_PREFERENCES.lang}. Use /lang en or /lang id.`)
+  } else if (command === '/place') {
+    if (value === 'world' || value === 'indonesia') setPreference('place', value)
+    await reply(`Digest place: ${state.preferences[chatId]?.place || DEFAULT_PREFERENCES.place}. Use /place world or /place Indonesia.`)
+  } else if (command === '/pair') {
+    if (msg.chat.type !== 'private') return reply('Send /pair and the code in a private chat with @HeadsUpNewsBot.')
+    if (!/^\d{4}$/.test(value)) return reply('Use /pair followed by the four-digit code on your glasses.')
+    const { device, error } = pairing.claim(value, chatId)
+    if (error === 'too_many_attempts') return reply('Too many pairing attempts. Wait a few minutes and request a new code.')
+    if (!device) return reply('That code is invalid or expired. Request a code on your glasses.')
+    state.devices[device] = chatId
+    if (!state.chats.includes(chatId)) state.chats.push(chatId)
+    persist()
+    await reply('Glasses paired. They will now show your personal digest.')
+  } else if (command === '/sources') {
+    await reply(`Sources (public RSS feeds):\n${FEEDS.map(feed => `${feed.source}: ${feed.url}`).join('\n')}\n\nHeads Up News rewrites short summaries and links to the original articles. It does not fetch full article bodies.`)
+  } else if (command === '/help') {
+    await reply(HELP)
   }
 }
 async function pollLoop() {
@@ -269,7 +435,14 @@ function extractAudio(req, body) {
 }
 
 // ---------- HTTP API for the G2 app ----------
-const server = createServer(async (req, res) => {
+function deviceId(value) {
+  return typeof value === 'string' && DEVICE_ID.test(value) ? value.toLowerCase() : null
+}
+function jsonResponse(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json' })
+  return res.end(JSON.stringify(body))
+}
+export const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
   res.setHeader('access-control-allow-origin', '*')
   res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS')
@@ -281,20 +454,44 @@ const server = createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true, updatedAt: state.updatedAt, stories: state.digest?.length || 0, linkedChats: state.chats.length }))
   }
   if (url.pathname === '/api/digest') {
-    res.writeHead(200, { 'content-type': 'application/json' })
-    return res.end(JSON.stringify({ updatedAt: state.updatedAt, stories: state.digest || [] }))
+    const requestedDevice = url.searchParams.get('device')
+    if (requestedDevice !== null) res.setHeader('cache-control', 'no-store')
+    const chatId = state.devices[deviceId(requestedDevice)]
+    const digest = chatId === undefined ? { updatedAt: state.updatedAt, stories: state.digest || [] } : await personalDigest(chatId)
+    return jsonResponse(res, 200, digest)
+  }
+  if (url.pathname === '/api/pair/start' && req.method === 'POST') {
+    res.setHeader('cache-control', 'no-store')
+    let body = '', size = 0
+    req.on('data', chunk => {
+      size += chunk.length
+      if (size <= 1024) body += chunk
+    })
+    req.on('end', () => {
+      if (size > 1024) return jsonResponse(res, 413, { ok: false, error: 'body_too_large' })
+      let device
+      try { device = deviceId(JSON.parse(body || '{}')?.device) } catch { /* invalid request */ }
+      if (!device) return jsonResponse(res, 400, { ok: false, error: 'invalid_device' })
+      if (Object.hasOwn(state.devices, device)) return jsonResponse(res, 409, { ok: false, error: 'device_already_paired' })
+      const request = pairing.start(device)
+      if (!request) return jsonResponse(res, 429, { ok: false, error: 'too_many_pending_pairs' })
+      return jsonResponse(res, 200, request)
+    })
+    return
   }
   if (url.pathname === '/api/save' && req.method === 'POST') {
     let body = ''
     req.on('data', c => (body += c))
     req.on('end', async () => {
       try {
-        const { storyId } = JSON.parse(body || '{}')
+        const { storyId, device } = JSON.parse(body || '{}')
         const story = (state.digest || []).find(s => s.id === storyId)
         if (!story) { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'story_not_found' })) }
+        const chatId = state.devices[deviceId(device)]
+        if (device !== undefined && chatId === undefined) return jsonResponse(res, 409, { ok: false, error: 'device_not_paired' })
         if (state.chats.length === 0) { res.writeHead(409, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'no_chat_linked', hint: 'Open @HeadsUpNewsBot and press /start first.' })) }
         state.saved.push({ storyId, at: new Date().toISOString() }); persist()
-        await sendToChats(`🔖 *Saved from your G2 glasses*\n\n*${story.headline}*\n${story.summary}\n_${story.source}_\n${story.url}`, 'Markdown')
+        await sendToChats([`🔖 Saved from your G2 glasses\n\n${story.headline}`, story.summary, story.source, story.url].filter(Boolean).join('\n'), chatId === undefined ? state.chats : [chatId])
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, saved: story.headline }))
       } catch (e) {
@@ -395,7 +592,19 @@ const server = createServer(async (req, res) => {
   res.end(JSON.stringify({ ok: false, error: 'not_found' }))
 })
 
-server.listen(PORT, '0.0.0.0', () => console.log(`[headsup] listening on :${PORT}`))
-refreshDigest('startup')
-setInterval(() => refreshDigest('scheduled'), REFRESH_MS)
-pollLoop()
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  mkdirSync(STATE_DIR, { recursive: true })
+  if (existsSync(STATE_FILE)) {
+    try { state = { ...state, ...JSON.parse(readFileSync(STATE_FILE, 'utf8')) } } catch { /* corrupt state: start fresh */ }
+  }
+  botToken = readFileSync(BOT_TOKEN_FILE, 'utf8').trim()
+  ogKey = readFileSync(OG_KEY_FILE, 'utf8').trim()
+  setInterval(() => {
+    const now = Date.now()
+    for (const [id, job] of voiceJobs) if (now - job.createdAt > VOICE_JOB_TTL_MS) voiceJobs.delete(id)
+  }, 60 * 1000)
+  server.listen(PORT, '0.0.0.0', () => console.log(`[headsup] listening on :${PORT}`))
+  refreshDigest('startup')
+  setInterval(() => refreshDigest('scheduled'), REFRESH_MS)
+  pollLoop()
+}
