@@ -378,12 +378,29 @@ export function savedMessage(saved, digest, chatId, linkedChats = []) {
   return `🔖 Saved stories\n\n${lines.join('\n\n')}${more}`
 }
 
-async function sendToChat(chatId, text) {
-  try {
-    const r = await tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true })
-    if (!r.ok) console.error('[tg] send failed', chatId, r.description)
-  } catch (e) { console.error('[tg] send error', chatId, e.message) }
+// Telegram rejects messages over 4096 characters; split on paragraph breaks.
+export function splitMessage(text, limit = 4096) {
+  const parts = []
+  let current = ''
+  for (const block of text.split('\n\n')) {
+    const joined = current ? `${current}\n\n${block}` : block
+    if (joined.length <= limit) { current = joined; continue }
+    if (current) parts.push(current)
+    current = block
+    while (current.length > limit) { parts.push(current.slice(0, limit)); current = current.slice(limit) }
+  }
+  if (current) parts.push(current)
+  return parts
 }
+async function sendToChat(chatId, text) {
+  for (const part of splitMessage(text)) {
+    try {
+      const r = await tg('sendMessage', { chat_id: chatId, text: part, disable_web_page_preview: true })
+      if (!r.ok) return console.error('[tg] send failed', chatId, r.description)
+    } catch (e) { return console.error('[tg] send error', chatId, e.message) }
+  }
+}
+
 async function sendToChats(text, chats = state.chats) {
   for (const chatId of chats) await sendToChat(chatId, text)
 }

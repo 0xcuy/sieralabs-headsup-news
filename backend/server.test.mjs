@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
 process.env.STATE_DIR = await mkdtemp(join(tmpdir(), 'headsup-test-'))
-const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, savedMessage, server } = await import('./server.mjs')
+const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, savedMessage, splitMessage, server } = await import('./server.mjs')
 
 const now = Date.now()
 const hour = 60 * 60 * 1000
@@ -60,6 +60,15 @@ test('manual refresh cooldown reports the remaining wait', () => {
   assert.equal(refreshWait(now, now), '5 min')
   assert.equal(refreshWait(now - 48 * 1000, now), '4 min 12 s')
   assert.equal(refreshWait(now - 4 * 60 * 1000 - 59500, now), '1 s')
+})
+
+test('long messages split on paragraph breaks within the Telegram limit', () => {
+  assert.deepEqual(splitMessage('short'), ['short'])
+  assert.deepEqual(splitMessage('aaaa\n\nbbbb\n\ncc', 10), ['aaaa\n\nbbbb', 'cc'])
+  assert.deepEqual(splitMessage('abcdefghijkl\n\nxy', 5), ['abcde', 'fghij', 'kl', 'xy'])
+  const parts = splitMessage(Array.from({ length: 10 }, (_, i) => `${i}. ${'x'.repeat(900)}`).join('\n\n'))
+  assert.ok(parts.length > 1 && parts.every(part => part.length <= 4096))
+  assert.equal(parts.join('\n\n').length, 10 * 903 + 9 * 2)
 })
 
 test('saved list is per chat, newest first, capped, and survives digest rotation', () => {
