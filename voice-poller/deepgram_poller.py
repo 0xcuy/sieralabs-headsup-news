@@ -1,44 +1,44 @@
 #!/usr/bin/env python3
-"""Heads Up News — Deepgram voice poller (SIERA Labs).
+"""Heads Up News — Deepgram voice poller (SIERA Labs), DROPLET version.
 
-Runs on the Muse VM (NOT on the droplet). Why here: the Deepgram credential
-(`custom.deepgram`) is held by the VM's authd and its surrogate (`hsurr:*`)
-is only substituted with the real key on VM egress through the runtime
-proxy. The droplet cannot call Deepgram itself, and no key — raw or
-surrogate — may ever be written to the droplet, an env var, or a file.
+Runs on the 32GB droplet as a systemd service (headsup-voice-poller),
+NOT on the Muse VM. Why: the VM's Deepgram credential (`custom.deepgram`)
+never reaches Deepgram — the authd surrogate swap is broken from the VM
+(proven 23 Nov 2026: every TTS/STT call 401s, Deepgram console shows
+0 requests / $0 used all week; the E2B list call from the VM 401s with
+"authorization header is missing" the same way). Do NOT use
+dynamic_credentials or any hsurr surrogate here.
 
-Flow: the droplet backend queues voice clips as jobs (POST /api/voice).
-This poller polls GET /api/voice-jobs, downloads each clip, transcribes it
-with Deepgram nova-2 from this VM (surrogate attached per request via the
-dynamic-credentials helper), and POSTs the transcript back to the droplet
-(POST /api/voice-result). The glasses app polls the droplet for the result.
+Auth is FILE-based: the Deepgram key is read from
+/root/.config/deepgram/api-key (mode 600, root only) and used as
+`Authorization: Token <key>`. The key value is NEVER printed or logged.
+If the key file is missing, the poller logs "waiting for key file" and
+retries every 30s instead of crashing — the user places the key at the
+staging path /home/siera/deepgram-api-key (writable by user siera, no
+sudo) and root moves it to /root/.config/deepgram/.
 
-Run it detached from a shell that has the runtime proxy env (it inherits
-HTTPS_PROXY etc.; without the proxy the VM has no egress at all):
-    setsid nohup python3 deepgram_poller.py >> voice-poller.log 2>&1 < /dev/null &
-It holds no secret: a fresh surrogate is minted per Deepgram call and kept
-only in memory. Nothing credential-like is ever printed or logged.
+Flow: the droplet backend (same box, 127.0.0.1:8787) queues voice clips
+as jobs (POST /api/voice). This poller polls GET /api/voice-jobs,
+downloads each clip, transcribes it with Deepgram nova-2, and POSTs the
+transcript back (POST /api/voice-result). The glasses app polls the
+backend for the result.
 
 Deepgram nova-2 costs ~$0.0043/min, so a 4s voice clip is ~$0.0003.
 """
 
 import json
 import os
-import sys
 import time
 import traceback
 import urllib.error
 import urllib.request
 
-sys.path.insert(0, '/opt/muse/skills/custom-connector-setup/bin')
-from dynamic_credentials import add_surrogate_to_request, read_json_response
-
-BASE = os.environ.get('VOICE_BASE', 'http://159.89.197.202:8787').rstrip('/')
-# Direct droplet IP on purpose: the TLS URL goes through Cloudflare, whose
-# bot protection 403s bare urllib requests (seen 23 Nov 2026). The droplet
-# API is the poller's own backend, so plain HTTP on the private port is fine.
+BASE = os.environ.get('VOICE_BASE', 'http://127.0.0.1:8787').rstrip('/')
+KEY_FILE = os.environ.get(
+    'DEEPGRAM_API_KEY_FILE', '/root/.config/deepgram/api-key')
 USER_AGENT = 'HeadsUpNews-VoicePoller/1.0'
 POLL_SECONDS = 1.0
+KEY_WAIT_SECONDS = 30
 MAX_ATTEMPTS = 3
 DG_URL = ('https://api.deepgram.com/v1/listen'
           '?model=nova-2&language=en&smart_format=true')
@@ -46,6 +46,17 @@ DG_URL = ('https://api.deepgram.com/v1/listen'
 
 def log(msg):
     print(f'{time.strftime("%Y-%m-%d %H:%M:%S")} [poller] {msg}', flush=True)
+
+
+def load_key():
+    """Read the Deepgram key from disk. Returns None if not present yet.
+    The value is never logged."""
+    try:
+        with open(KEY_FILE, 'r') as f:
+            key = f.read().strip()
+        return key or None
+    except OSError:
+        return None
 
 
 def http_json(method, url, body=None, headers=None, timeout=30):
@@ -57,15 +68,14 @@ def http_json(method, url, body=None, headers=None, timeout=30):
         return resp.status, resp.read()
 
 
-def transcribe(audio_bytes, mime):
-    """One Deepgram call. Surrogate attached via the helper; never logged."""
+def transcribe(audio_bytes, mime, key):
+    """One Deepgram call with the file-based key. Key never logged."""
     req = urllib.request.Request(DG_URL, data=audio_bytes, method='POST')
     req.add_header('User-Agent', USER_AGENT)
     req.add_header('Content-Type', mime or 'audio/wav')
-    add_surrogate_to_request(req, 'custom.deepgram',
-                             allowed_hosts=['api.deepgram.com'])
+    req.add_header('Authorization', 'Token ' + key)
     with urllib.request.urlopen(req, timeout=60) as resp:
-        data = read_json_response(resp)
+        data = json.loads(resp.read())
     alt = data['results']['channels'][0]['alternatives'][0]
     return (alt.get('transcript') or '').strip()
 
@@ -79,9 +89,18 @@ def post_result(job_id, transcript=None, error=None):
 
 
 def main():
-    log(f'started, backend={BASE}')
+    log(f'started, backend={BASE}, key_file={KEY_FILE}')
     attempts = {}
+    last_wait_log = 0.0
     while True:
+        key = load_key()
+        if key is None:
+            now = time.time()
+            if now - last_wait_log >= KEY_WAIT_SECONDS:
+                log(f'waiting for key file: {KEY_FILE}')
+                last_wait_log = now
+            time.sleep(KEY_WAIT_SECONDS)
+            continue
         try:
             _, raw = http_json('GET', f'{BASE}/api/voice-jobs', timeout=15)
             jobs = json.loads(raw).get('jobs', [])
@@ -95,7 +114,8 @@ def main():
                 _, audio = http_json(
                     'GET', f'{BASE}/api/voice/{job_id}/audio', timeout=15)
                 # The audio endpoint returns raw bytes, not JSON.
-                transcript = transcribe(audio, job.get('mime') or 'audio/wav')
+                transcript = transcribe(
+                    audio, job.get('mime') or 'audio/wav', key)
                 post_result(job_id, transcript=transcript)
                 attempts.pop(job_id, None)
                 log(f'job {job_id[:8]} "{transcript}"')
