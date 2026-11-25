@@ -37,6 +37,45 @@ important stories and rewrite each to a ≤10-word headline and a ≤18-word
 summary. If the model call fails, the backend shows shortened RSS
 headlines with source links, without copying descriptions into summaries.
 
+## Telegram commands
+
+| Command | What it does |
+| --- | --- |
+| `/start` | Link this chat |
+| `/digest` | Show your latest digest |
+| `/saved` | List the stories this chat saved from the glasses, newest first (last 10) |
+| `/refresh` | Fetch a fresh digest now and send it (once every 5 minutes per chat on Free) |
+| `/pro` | Show the Free and Pro plans |
+| `/alerts on\|off` | Toggle breaking-news alerts |
+| `/topics` | Set priority categories (or `all`) |
+| `/lang en\|id` | Set digest language |
+| `/place world\|Indonesia` | Set geographic priority |
+| `/pair CODE` | Link your glasses in a private chat |
+| `/sources` | List news feeds |
+| `/help` | List all commands |
+
+Every bot message is sent as plain text (no `parse_mode`), because the
+AI-written digest can contain stray Markdown characters.
+
+## Plans
+
+| | Free | Pro — $3/month |
+| --- | --- | --- |
+| Digest | 8-story digest every 30 min | Same, plus `/refresh` anytime (no cooldown) |
+| Breaking alerts | Yes | Yes |
+| Saved stories | Yes | Unlimited |
+| Topics | Yes | Unlimited |
+| Paired glasses | 1 | Up to 3 devices |
+| Languages | English + Indonesian | English + Indonesian |
+| New features | — | Early access |
+
+Payment is not wired up yet (coming soon). `/pro` shows these plans in
+Telegram.
+
+## Feedback
+
+Early feedback from the Even Realities organizers (TVM Ventures) raised four questions: personalization (topics, places, languages), breaking-news delivery, publisher terms for summaries, and monetization. The current release covers all four — personalization (/topics, /lang, /place), breaking alerts (/alerts), publisher terms (Sources & licensing), and freemium tiers (/pro).
+
 ## Sources & licensing
 
 Heads Up News uses the public RSS feeds from [BBC World](https://feeds.bbci.co.uk/news/world/rss.xml),
