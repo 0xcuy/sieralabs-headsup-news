@@ -6,7 +6,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { createServer } from 'node:http'
-import { randomUUID, randomInt } from 'node:crypto'
+import { randomUUID, randomInt, createHash } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 
 const PORT = Number(process.env.PORT || 8787)
@@ -196,11 +196,16 @@ function buildDigest(candidates, rewritten, breaking) {
     if (s && Number.isInteger(s.candidate) && candidates[s.candidate - 1] && !selections.has(s.candidate)) selections.set(s.candidate, s)
   }
   const order = [...new Set([...(breaking ? [1] : []), ...selections.keys(), ...candidates.map((_, i) => i + 1)])]
-  const stamp = Date.now().toString(36)
+  const ids = new Set()
   return order.slice(0, MAX_STORIES).map((key, i) => {
     const c = candidates[key - 1], s = selections.get(key)
+    // Stable per article so ids shown on the glasses survive refreshes.
+    const base = `s${createHash('sha256').update(c.url).digest('hex').slice(0, 12)}`
+    const id = ids.has(base) ? `${base}-${i}` : base
+    ids.add(id)
     return {
-      id: `s${stamp}-${i}`,
+      id,
+
       headline: limitText(s?.headline, 10, 120) || limitText(c.title, 10, 120),
       summary: limitText(s?.summary, 18, 220),
       category: CATEGORIES.includes(s?.category) ? s.category : c.source === 'The Verge' ? 'TECH' : 'WORLD',
