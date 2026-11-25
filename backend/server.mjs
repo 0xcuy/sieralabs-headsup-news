@@ -6,7 +6,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { createServer } from 'node:http'
-import { randomUUID, randomInt } from 'node:crypto'
+import { randomUUID, randomInt, createHash } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 
 const PORT = Number(process.env.PORT || 8787)
@@ -196,11 +196,11 @@ function buildDigest(candidates, rewritten, breaking) {
     if (s && Number.isInteger(s.candidate) && candidates[s.candidate - 1] && !selections.has(s.candidate)) selections.set(s.candidate, s)
   }
   const order = [...new Set([...(breaking ? [1] : []), ...selections.keys(), ...candidates.map((_, i) => i + 1)])]
-  const stamp = Date.now().toString(36)
-  return order.slice(0, MAX_STORIES).map((key, i) => {
+  return order.slice(0, MAX_STORIES).map(key => {
     const c = candidates[key - 1], s = selections.get(key)
     return {
-      id: `s${stamp}-${i}`,
+      // Stable per article (candidates are unique by url) so ids shown on the glasses survive refreshes.
+      id: `s${createHash('sha256').update(c.url).digest('hex').slice(0, 12)}`,
       headline: limitText(s?.headline, 10, 120) || limitText(c.title, 10, 120),
       summary: limitText(s?.summary, 18, 220),
       category: CATEGORIES.includes(s?.category) ? s.category : c.source === 'The Verge' ? 'TECH' : 'WORLD',
@@ -231,7 +231,7 @@ async function runRefresh(reason) {
   const seen = new Set()
   const candidates = [...(breaking ? [breaking] : []), ...all
     .filter(c => !breaking || (c !== breaking && c.url !== breaking.url && !sameStory(c, breaking)))
-    .filter(c => { const k = c.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40); if (seen.has(k)) return false; seen.add(k); return true })
+    .filter(c => { const k = c.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40); if (seen.has(k) || seen.has(c.url)) return false; seen.add(k).add(c.url); return true })
     .sort((a, b) => publicationTime(b) - publicationTime(a))].slice(0, 14)
   if (candidates.length === 0) { console.error('[digest] no RSS items at all'); return false }
   try {
@@ -354,10 +354,12 @@ export function refreshWait(lastAt, now = Date.now()) {
 function wibTime(iso) {
   return `${new Date(iso).toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' })} WIB`
 }
-// Saves record the chats they were delivered to; older entries without
-// that field were broadcast to every linked chat.
+// Saves record the chats they were delivered to. Older entries without that
+// field cannot be attributed, so they are shown only while one chat is linked.
 export function savedMessage(saved, digest, chatId, linkedChats = []) {
-  const mine = saved.filter(entry => entry.chats ? entry.chats.includes(chatId) : linkedChats.includes(chatId))
+  const legacyOwner = linkedChats.length === 1 && linkedChats[0] === chatId
+  const mine = saved.filter(entry => entry.chats ? entry.chats.includes(chatId) : legacyOwner)
+
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
   if (!mine.length) return 'No saved stories yet. Save one from your glasses with the ★ action or say "save this".'
   const lines = mine.slice(0, MAX_SAVED_LIST).map((entry, i) => {
@@ -371,12 +373,29 @@ export function savedMessage(saved, digest, chatId, linkedChats = []) {
   return `🔖 Saved stories\n\n${lines.join('\n\n')}${more}`
 }
 
-async function sendToChat(chatId, text) {
-  try {
-    const r = await tg('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true })
-    if (!r.ok) console.error('[tg] send failed', chatId, r.description)
-  } catch (e) { console.error('[tg] send error', chatId, e.message) }
+// Telegram rejects messages over 4096 characters; split on paragraph breaks.
+export function splitMessage(text, limit = 4096) {
+  const parts = []
+  let current = ''
+  for (const block of text.split('\n\n')) {
+    const joined = current ? `${current}\n\n${block}` : block
+    if (joined.length <= limit) { current = joined; continue }
+    if (current) parts.push(current)
+    current = block
+    while (current.length > limit) { parts.push(current.slice(0, limit)); current = current.slice(limit) }
+  }
+  if (current) parts.push(current)
+  return parts
 }
+async function sendToChat(chatId, text) {
+  for (const part of splitMessage(text)) {
+    try {
+      const r = await tg('sendMessage', { chat_id: chatId, text: part, disable_web_page_preview: true })
+      if (!r.ok) return console.error('[tg] send failed', chatId, r.description)
+    } catch (e) { return console.error('[tg] send error', chatId, e.message) }
+  }
+}
+
 async function sendToChats(text, chats = state.chats) {
   for (const chatId of chats) await sendToChat(chatId, text)
 }
@@ -429,9 +448,13 @@ export async function handleUpdate(u) {
     const wait = refreshWait(manualRefreshAt.get(chatId))
     if (wait) return reply(`You can refresh again in ${wait}. The digest also refreshes every 30 min.`)
     manualRefreshAt.set(chatId, Date.now())
-    const ok = await refreshDigest('telegram')
-    if (!ok) await reply('Could not fetch fresh news right now. Here is the latest digest.')
-    await reply(digestMessage(await personalDigest(chatId)))
+    await reply('Refreshing now. Your new digest will follow in a moment.')
+    // Detached so a slow refresh does not hold up other chats' commands in pollLoop.
+    void refreshDigest('telegram').then(async ok => {
+      if (!ok) await reply('Could not fetch fresh news right now. Here is the latest digest.')
+      await reply(digestMessage(await personalDigest(chatId)))
+    }).catch(e => console.error('[tg] /refresh failed', chatId, e.message))
+
   } else if (command === '/pro') {
     await reply(PRO)
   } else if (command === '/sources') {

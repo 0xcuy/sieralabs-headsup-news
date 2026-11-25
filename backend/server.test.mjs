@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
 process.env.STATE_DIR = await mkdtemp(join(tmpdir(), 'headsup-test-'))
-const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, savedMessage, server } = await import('./server.mjs')
+const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, savedMessage, splitMessage, server } = await import('./server.mjs')
 
 const now = Date.now()
 const hour = 60 * 60 * 1000
@@ -62,6 +62,15 @@ test('manual refresh cooldown reports the remaining wait', () => {
   assert.equal(refreshWait(now - 4 * 60 * 1000 - 59500, now), '1 s')
 })
 
+test('long messages split on paragraph breaks within the Telegram limit', () => {
+  assert.deepEqual(splitMessage('short'), ['short'])
+  assert.deepEqual(splitMessage('aaaa\n\nbbbb\n\ncc', 10), ['aaaa\n\nbbbb', 'cc'])
+  assert.deepEqual(splitMessage('abcdefghijkl\n\nxy', 5), ['abcde', 'fghij', 'kl', 'xy'])
+  const parts = splitMessage(Array.from({ length: 10 }, (_, i) => `${i}. ${'x'.repeat(900)}`).join('\n\n'))
+  assert.ok(parts.length > 1 && parts.every(part => part.length <= 4096))
+  assert.equal(parts.join('\n\n').length, 10 * 903 + 9 * 2)
+})
+
 test('saved list is per chat, newest first, capped, and survives digest rotation', () => {
   const at = i => new Date(now - i * hour).toISOString()
   const digest = [{ id: 'live', headline: 'Live headline', source: 'BBC', url: 'https://example.test/live' }]
@@ -76,6 +85,8 @@ test('saved list is per chat, newest first, capped, and survives digest rotation
     ['1. Live headline', '2. Snapshot headline', '3. Saved story (no longer in the digest)'])
   assert.match(text, /\nhttps:\/\/example\.test\/live\nSaved .+ WIB/)
   assert.doesNotMatch(text, /Not mine/)
+  assert.doesNotMatch(savedMessage(saved, digest, 7, [7, 8]), /no longer in the digest/)
+
   assert.match(savedMessage(saved, digest, 9, [7]), /^No saved stories yet/)
   const many = Array.from({ length: 12 }, (_, i) => ({ storyId: `s${i}`, at: at(i), chats: [7], headline: `Story ${i}` }))
   const capped = savedMessage(many, [], 7, [])
@@ -172,11 +183,15 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assert.match(sent.at(-1).text, /^No saved stories yet/)
   await bot(2, '/saved')
   assert.match(sent.at(-1).text, new RegExp(`^🔖 Saved stories\n\n1\. ${lead.title}\nBBC\n`))
+  const updatesSent = sent.length
   await bot(2, '/refresh')
+  assert.equal(sent.at(-1).text, 'Refreshing now. Your new digest will follow in a moment.')
+  for (let i = 0; i < 200 && !(sent.length > updatesSent + 1 && sent.at(-1).text.startsWith('📰')); i++) await new Promise(resolve => setTimeout(resolve, 10))
   const refreshed = await digests(device)
   assert.notEqual(refreshed.updatedAt, personalized.updatedAt)
-  assert.notEqual(refreshed.stories[0].id, personalized.stories[0].id)
+  assert.equal(refreshed.stories[0].id, personalized.stories[0].id)
   assertPlainDigest(refreshed, 'Ringkasan Berita', 'Diperbarui')
+  assert.equal((await api('/api/save', { storyId: personalized.stories[0].id, device })).status, 200)
   await bot(2, '/refresh')
   assert.match(sent.at(-1).text, /^You can refresh again in (?:4 min \d+ s|5 min)\./)
   assert.equal((await digests(device)).updatedAt, refreshed.updatedAt)
@@ -198,6 +213,6 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   const state = JSON.parse(await readFile(join(process.env.STATE_DIR, 'state.json'), 'utf8'))
   assert.equal(state.alerts.length, 1)
   assert.equal(state.devices[device], 2)
-  assert.deepEqual(state.saved.map(({ chats, headline }) => ({ chats, headline })), [{ chats: [2], headline: lead.title }])
+  assert.deepEqual(state.saved.map(({ chats, headline }) => ({ chats, headline })), [{ chats: [2], headline: lead.title }, { chats: [2], headline: lead.title }])
   assert.deepEqual(state.preferences[2], { alerts: false, place: 'indonesia', topics: ['SCIENCE'], lang: 'id' })
 })
