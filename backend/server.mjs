@@ -46,7 +46,28 @@ const HELP = [
   '/lang en|id — set digest language',
   '/place world|Indonesia — set geographic priority',
   '/pair CODE — link your glasses in this private chat',
+  '/saved — list stories you saved from your glasses',
+  '/refresh — fetch a fresh digest now',
+  '/pro — see Free and Pro plans',
   '/sources — list news feeds',
+].join('\n')
+const PRO = [
+  'Heads Up News plans',
+  '',
+  'Free',
+  '- 8-story digest every 30 min',
+  '- Breaking alerts',
+  '- 1 paired glasses',
+  '- English + Indonesian',
+  '',
+  'Pro — $3/month',
+  '- Unlimited saved stories',
+  '- /refresh anytime (no cooldown)',
+  '- Unlimited topics',
+  '- Up to 3 paired devices',
+  '- Early access to new features',
+  '',
+  'Payment is not wired up yet (coming soon).',
 ].join('\n')
 
 const MAX_STORIES = 8
@@ -58,6 +79,8 @@ const CATEGORIES = ['WORLD', 'TECH', 'BUSINESS', 'SPORT', 'SCIENCE', 'CULTURE']
 const DEFAULT_PREFERENCES = { topics: [], lang: 'en', place: 'world', alerts: true }
 const INDONESIA = /\b(?:indonesia(?:n)?|jakarta|bali|surabaya|yogyakarta|bandung|sulawesi|sumatra|jokowi|prabowo)\b/i
 const PAIR_TTL_MS = 10 * 60 * 1000
+const MAX_SAVED_LIST = 10
+const MANUAL_REFRESH_COOLDOWN_MS = 5 * 60 * 1000
 const DEVICE_ID = /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i
 
 let state = { digest: null, updatedAt: null, chats: [], saved: [], preferences: {}, devices: {}, alerts: [] }
@@ -320,6 +343,33 @@ export function createPairing(now = Date.now, nextCode = () => String(randomInt(
   }
 }
 const pairing = createPairing()
+const manualRefreshAt = new Map()
+
+export function refreshWait(lastAt, now = Date.now()) {
+  const left = lastAt === undefined ? 0 : lastAt + MANUAL_REFRESH_COOLDOWN_MS - now
+  if (left <= 0) return null
+  const seconds = Math.ceil(left / 1000), min = Math.floor(seconds / 60), sec = seconds % 60
+  return [min && `${min} min`, sec && `${sec} s`].filter(Boolean).join(' ')
+}
+function wibTime(iso) {
+  return `${new Date(iso).toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' })} WIB`
+}
+// Saves record the chats they were delivered to; older entries without
+// that field were broadcast to every linked chat.
+export function savedMessage(saved, digest, chatId, linkedChats = []) {
+  const mine = saved.filter(entry => entry.chats ? entry.chats.includes(chatId) : linkedChats.includes(chatId))
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+  if (!mine.length) return 'No saved stories yet. Save one from your glasses with the ★ action or say "save this".'
+  const lines = mine.slice(0, MAX_SAVED_LIST).map((entry, i) => {
+    const story = (digest || []).find(s => s.id === entry.storyId) || entry
+    const when = `Saved ${wibTime(entry.at)}`
+    return story.headline
+      ? [`${i + 1}. ${story.headline}`, story.source, story.url, when].filter(Boolean).join('\n')
+      : `${i + 1}. Saved story (no longer in the digest)\n${when}`
+  })
+  const more = mine.length > MAX_SAVED_LIST ? `\n\nShowing the ${MAX_SAVED_LIST} most recent of ${mine.length}.` : ''
+  return `🔖 Saved stories\n\n${lines.join('\n\n')}${more}`
+}
 
 async function sendToChat(chatId, text) {
   try {
@@ -373,6 +423,17 @@ export async function handleUpdate(u) {
     if (!state.chats.includes(chatId)) state.chats.push(chatId)
     persist()
     await reply('Glasses paired. They will now show your personal digest.')
+  } else if (command === '/saved') {
+    await reply(savedMessage(state.saved, state.digest, chatId, state.chats))
+  } else if (command === '/refresh') {
+    const wait = refreshWait(manualRefreshAt.get(chatId))
+    if (wait) return reply(`You can refresh again in ${wait}. The digest also refreshes every 30 min.`)
+    manualRefreshAt.set(chatId, Date.now())
+    const ok = await refreshDigest('telegram')
+    if (!ok) await reply('Could not fetch fresh news right now. Here is the latest digest.')
+    await reply(digestMessage(await personalDigest(chatId)))
+  } else if (command === '/pro') {
+    await reply(PRO)
   } else if (command === '/sources') {
     await reply(`Sources (public RSS feeds):\n${FEEDS.map(feed => `${feed.source}: ${feed.url}`).join('\n')}\n\nHeads Up News rewrites short summaries and links to the original articles. It does not fetch full article bodies.`)
   } else if (command === '/help') {
@@ -491,8 +552,9 @@ export const server = createServer(async (req, res) => {
         const chatId = state.devices[deviceId(device)]
         if (device !== undefined && chatId === undefined) return jsonResponse(res, 409, { ok: false, error: 'device_not_paired' })
         if (state.chats.length === 0) { res.writeHead(409, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'no_chat_linked', hint: 'Open @HeadsUpNewsBot and press /start first.' })) }
-        state.saved.push({ storyId, at: new Date().toISOString() }); persist()
-        await sendToChats([`🔖 Saved from your G2 glasses\n\n${story.headline}`, story.summary, story.source, story.url].filter(Boolean).join('\n'), chatId === undefined ? state.chats : [chatId])
+        const chats = chatId === undefined ? [...state.chats] : [chatId]
+        state.saved.push({ storyId, at: new Date().toISOString(), chats, headline: story.headline, source: story.source, url: story.url }); persist()
+        await sendToChats([`🔖 Saved from your G2 glasses\n\n${story.headline}`, story.summary, story.source, story.url].filter(Boolean).join('\n'), chats)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, saved: story.headline }))
       } catch (e) {
