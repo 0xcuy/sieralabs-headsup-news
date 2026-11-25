@@ -34,8 +34,26 @@ The digest itself is written by an AI agent: every 30 minutes the backend
 pulls world-news RSS (BBC, The Guardian, Al Jazeera, The Verge), dedupes
 and ranks by recency, and asks GLM (via the 0G router) to pick the 8 most
 important stories and rewrite each to a ≤10-word headline and a ≤18-word
-summary. If the model call fails, the backend falls back to the raw RSS
-headlines so the glasses never go empty.
+summary. If the model call fails, the backend shows shortened RSS
+headlines with source links, without copying descriptions into summaries.
+
+## Sources & licensing
+
+Heads Up News uses the public RSS feeds from [BBC World](https://feeds.bbci.co.uk/news/world/rss.xml),
+[The Guardian World](https://www.theguardian.com/world/rss),
+[Al Jazeera](https://www.aljazeera.com/xml/rss/all.xml), and
+[The Verge](https://www.theverge.com/rss/index.xml). Use `/sources` in
+Telegram to see the active feeds.
+
+We use only the RSS title and description as story text, plus the source,
+link and publication date for attribution. Summaries are short rewrites
+based on that feed text. Each story names its publisher and links to the
+original article. We do not fetch or reproduce full article bodies or
+bypass paywalls. Publishers retain their rights; a public RSS feed does
+not imply a license to republish its content. We honor publisher
+takedown requests: contact SIERA Labs through the
+[repository issue tracker](https://github.com/0xcuy/sieralabs-headsup-news/issues)
+with the story URL or feed so we can remove it.
 
 ## Repo layout
 
@@ -66,15 +84,45 @@ chmod 600 /root/.config/0g-router/api-key
 node backend/server.mjs          # listens on :8787
 ```
 
-Endpoints: `GET /health`, `GET /api/digest`, `POST /api/save {storyId}`,
+Endpoints: `GET /health`, `GET /api/digest`, `POST /api/save {storyId, device?}`,
 `POST /api/refresh`, plus the voice queue: `POST /api/voice` (audio clip →
 `202 {jobId}`), `GET /api/voice/:jobId` (poll for the transcript + command),
 `GET /api/voice-jobs` and `POST /api/voice-result` (voice poller only).
 The digest refreshes automatically every 30 minutes.
 
 Then open Telegram, find your bot, and press **/start** — that links your
-chat so glasses saves can reach you. Without it, saving returns
-`no_chat_linked` and the glasses tell you to `/start` first.
+chat. Breaking alerts are on by default for linked chats; use
+`/alerts off` to opt out or `/alerts on` to opt back in. A story from
+the last two hours qualifies if two distinct feeds have strongly matching
+headlines or if its headline is explicitly labeled Breaking or Urgent.
+The lead goes first in the digest, with at least one hour between alerts
+and no repeat alerts for matching stories for 48 hours.
+
+Use `/topics TECH, SCIENCE` (or `/topics all` to reset), `/place Indonesia`
+(or `/place world`), and `/lang en` or `/lang id`. The digest keeps the
+breaking lead first and prioritizes matching places and categories when
+the feeds carry them. Indonesian text is translated from the same digest;
+if translation fails, the API flags the English fallback.
+
+#### Glasses pairing API
+
+1. Generate and store a random UUID v4 as the private device ID. Send
+   `POST /api/pair/start` with JSON `{"device":"<uuid>"}` and display the
+   returned `code` (a four-character string, which may start with zero).
+   The response contains `expiresAt` in Unix milliseconds. Codes are
+   single-use and expire after 10 minutes.
+2. The user sends `/pair <code>` in a private chat with `@HeadsUpNewsBot`.
+3. Use `GET /api/digest?device=<uuid>` to get that chat's digest. Unpaired
+   devices and requests without a device receive the global digest. For a
+   paired device the response adds `lang` and, on fallback,
+   `translationUnavailable: true`.
+4. Include the same `device` in the `POST /api/save` JSON object to deliver
+   to only the paired chat. An unpaired device supplied to save is rejected;
+   omitting the device keeps the legacy broadcast to linked chats.
+
+Use HTTPS and keep the device UUID private. Do not expose or include it in
+telemetry. A paired UUID cannot be reassigned; generate a new UUID to pair
+again.
 
 ### Voice relay (Deepgram STT) — runs on the Muse VM, not the droplet
 
@@ -124,8 +172,9 @@ The app fetches its digest from the backend URL in `src/main.ts`
   systemd services, verified end-to-end in the free simulator.
 - **UX for display and voice (15%)** — 3 lines per story, ring + tap, plus
   voice commands ("next" / "save this" / "repeat") via Deepgram STT.
-- **Business potential and safety (20%)** — read-only news, no funds, no
-  personal data beyond the user's own Telegram chat id.
+- **Business potential and safety (20%)** — read-only news, no funds.
+  Personalization stores the Telegram chat ID, digest preferences, and
+  any paired device UUID.
 
 ## AI usage disclosure
 
