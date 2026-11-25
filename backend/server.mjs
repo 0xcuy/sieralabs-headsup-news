@@ -354,10 +354,12 @@ export function refreshWait(lastAt, now = Date.now()) {
 function wibTime(iso) {
   return `${new Date(iso).toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' })} WIB`
 }
-// Saves record the chats they were delivered to; older entries without
-// that field were broadcast to every linked chat.
+// Saves record the chats they were delivered to. Older entries without that
+// field cannot be attributed, so they are shown only while one chat is linked.
 export function savedMessage(saved, digest, chatId, linkedChats = []) {
-  const mine = saved.filter(entry => entry.chats ? entry.chats.includes(chatId) : linkedChats.includes(chatId))
+  const legacyOwner = linkedChats.length === 1 && linkedChats[0] === chatId
+  const mine = saved.filter(entry => entry.chats ? entry.chats.includes(chatId) : legacyOwner)
+
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
   if (!mine.length) return 'No saved stories yet. Save one from your glasses with the ★ action or say "save this".'
   const lines = mine.slice(0, MAX_SAVED_LIST).map((entry, i) => {

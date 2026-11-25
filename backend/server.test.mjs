@@ -76,6 +76,8 @@ test('saved list is per chat, newest first, capped, and survives digest rotation
     ['1. Live headline', '2. Snapshot headline', '3. Saved story (no longer in the digest)'])
   assert.match(text, /\nhttps:\/\/example\.test\/live\nSaved .+ WIB/)
   assert.doesNotMatch(text, /Not mine/)
+  assert.doesNotMatch(savedMessage(saved, digest, 7, [7, 8]), /no longer in the digest/)
+
   assert.match(savedMessage(saved, digest, 9, [7]), /^No saved stories yet/)
   const many = Array.from({ length: 12 }, (_, i) => ({ storyId: `s${i}`, at: at(i), chats: [7], headline: `Story ${i}` }))
   const capped = savedMessage(many, [], 7, [])
