@@ -38,12 +38,25 @@ const FEEDS = [
   { source: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml' },
   { source: 'The Verge', url: 'https://www.theverge.com/rss/index.xml' },
 ]
+export const LANGUAGES = {
+  en: { name: 'English', native: 'English', title: 'News Digest', updated: 'Updated', locale: 'en-GB' },
+  id: { name: 'Indonesian', native: 'Bahasa Indonesia', prompt: 'Bahasa Indonesia', title: 'Ringkasan Berita', updated: 'Diperbarui', locale: 'id-ID' },
+  ru: { name: 'Russian', native: 'Русский', title: 'Новостной дайджест', updated: 'Обновлено', locale: 'ru-RU' },
+  zh: { name: 'Chinese (Simplified)', native: '简体中文', prompt: 'Simplified Chinese', title: '新闻摘要', updated: '更新于', locale: 'zh-CN' },
+  es: { name: 'Spanish', native: 'Español', title: 'Resumen de noticias', updated: 'Actualizado', locale: 'es-ES' },
+  fr: { name: 'French', native: 'Français', title: 'Résumé de l’actualité', updated: 'Mis à jour', locale: 'fr-FR' },
+  de: { name: 'German', native: 'Deutsch', title: 'Nachrichtenüberblick', updated: 'Aktualisiert', locale: 'de-DE' },
+  ja: { name: 'Japanese', native: '日本語', title: 'ニュースダイジェスト', updated: '更新', locale: 'ja-JP' },
+  ar: { name: 'Arabic', native: 'العربية', title: 'موجز الأخبار', updated: 'آخر تحديث', locale: 'ar-EG' },
+  pt: { name: 'Portuguese', native: 'Português', title: 'Resumo de notícias', updated: 'Atualizado', locale: 'pt-BR' },
+}
+const LANGUAGE_LIST = Object.entries(LANGUAGES).map(([code, l]) => `${code} ${l.name}`).join(', ')
 const HELP = [
   '/start — link this chat',
   '/digest — show your latest digest',
   '/alerts on|off — toggle breaking-news alerts',
   '/topics — set priority categories (or all)',
-  '/lang en|id — set digest language',
+  `/lang ${Object.keys(LANGUAGES).join('|')} — set digest language`,
   '/place world|Indonesia — set geographic priority',
   '/pair CODE — link your glasses in this private chat',
   '/saved — list stories you saved from your glasses',
@@ -58,7 +71,7 @@ const PRO = [
   '- 8-story digest every 30 min',
   '- Breaking alerts',
   '- 1 paired glasses',
-  '- English + Indonesian',
+  `- ${Object.keys(LANGUAGES).length} digest languages (/lang)`,
   '',
   'Pro — $3/month',
   '- Unlimited saved stories',
@@ -269,40 +282,44 @@ export function rankDigest(stories, prefs) {
     (prefs.topics.includes(s.category) ? 1 : 0)
   return [...stories].sort((a, b) => score(b) - score(a))
 }
-let translationCache
-function translateDigest(stories) {
-  if (translationCache?.stories !== stories) {
+const translationCache = new Map() // lang -> { stories, promise }
+export function translateDigest(stories, lang) {
+  const language = LANGUAGES[lang], target = language.prompt || language.name
+  if (translationCache.get(lang)?.stories !== stories) {
     const list = stories.map((s, i) => ({ candidate: i + 1, headline: s.headline, summary: s.summary }))
-    const prompt = `Translate each headline and summary into Bahasa Indonesia. Max 10 headline words and 18 summary words. Keep the facts; use an empty summary if the original is empty. Return only a JSON array with candidate, headline, and summary for each entry.\n${JSON.stringify(list)}`
+    const prompt = `Translate each headline and summary into ${target}. Max 10 headline words and 18 summary words. Keep the facts; use an empty summary if the original is empty. Return only a JSON array with candidate, headline, and summary for each entry.\n${JSON.stringify(list)}`
     const promise = askModel(prompt, 20000).then(rows => {
       const byNumber = new Map(rows.filter(Boolean).map(s => [s.candidate, s]))
       return stories.map((story, i) => {
         const row = byNumber.get(i + 1)
         const headline = limitText(row?.headline, 10, 120), summary = limitText(row?.summary, 18, 220)
-        if (!headline || (story.summary && !summary)) throw new Error('incomplete Indonesian translation')
+        if (!headline || (story.summary && !summary)) throw new Error(`incomplete ${language.name} translation`)
         return { ...story, headline, summary: story.summary ? summary : '' }
       })
     }).catch(e => {
-      console.error('[digest] Indonesian translation failed:', e.message)
-      if (translationCache?.stories === stories) translationCache = undefined
+      console.error(`[digest] ${language.name} translation failed:`, e.message)
+      if (translationCache.get(lang)?.stories === stories) translationCache.delete(lang)
       return null
     })
-    translationCache = { stories, promise }
+    translationCache.set(lang, { stories, promise })
   }
-  return translationCache.promise
+  return translationCache.get(lang).promise
 }
 async function personalDigest(chatId) {
   const { digest, updatedAt } = state
   const { lang, ...prefs } = { ...DEFAULT_PREFERENCES, ...state.preferences[chatId] }
-  const translated = lang === 'id' && digest?.length ? await translateDigest(digest) : null
+  const wanted = Object.hasOwn(LANGUAGES, lang) ? lang : 'en'
+  const translated = wanted !== 'en' && digest?.length ? await translateDigest(digest, wanted) : null
   const stories = rankDigest(translated || digest || [], prefs)
-  return { updatedAt, stories, lang: translated ? 'id' : 'en', ...(lang === 'id' && !translated && stories.length ? { translationUnavailable: true } : {}) }
+  return { updatedAt, stories, lang: translated ? wanted : 'en', ...(wanted !== 'en' && !translated && stories.length ? { translationUnavailable: true, requestedLang: wanted } : {}) }
 }
-function digestMessage({ stories, updatedAt, lang, translationUnavailable }) {
+export function digestMessage({ stories, updatedAt, lang, translationUnavailable, requestedLang }) {
   if (!stories.length) return 'No digest yet — try again in a minute.'
   const lines = stories.map((s, i) => [`${i + 1}. ${s.headline}`, s.summary, s.source, s.url].filter(Boolean).join('\n'))
-  const date = new Date(updatedAt).toLocaleString(lang === 'id' ? 'id-ID' : 'en-GB', { timeZone: 'Asia/Jakarta' })
-  return `📰 Heads Up — ${lang === 'id' ? 'Ringkasan Berita' : 'News Digest'}\n${lang === 'id' ? 'Diperbarui' : 'Updated'} ${date} WIB${translationUnavailable ? '\nIndonesian translation unavailable; showing English.' : ''}\n\n${lines.join('\n\n')}`
+  const l = LANGUAGES[lang] || LANGUAGES.en
+  const date = new Date(updatedAt).toLocaleString(l.locale, { timeZone: 'Asia/Jakarta' })
+  const fallback = translationUnavailable ? `\n${LANGUAGES[requestedLang]?.name || 'The'} translation unavailable; showing English.` : ''
+  return `📰 Heads Up — ${l.title}\n${l.updated} ${date} WIB${fallback}\n\n${lines.join('\n\n')}`
 }
 
 export function createPairing(now = Date.now, nextCode = () => String(randomInt(10000)).padStart(4, '0')) {
@@ -427,8 +444,10 @@ export async function handleUpdate(u) {
     else if (topics.length && topics.every(topic => CATEGORIES.includes(topic))) setPreference('topics', topics)
     await reply(`Priority topics: ${(state.preferences[chatId]?.topics || []).join(', ') || 'all'}. Use /topics followed by any of: ${CATEGORIES.join(', ')}. Use /topics all to reset.`)
   } else if (command === '/lang') {
-    if (value === 'en' || value === 'id') setPreference('lang', value)
-    await reply(`Digest language: ${state.preferences[chatId]?.lang || DEFAULT_PREFERENCES.lang}. Use /lang en or /lang id.`)
+    if (value && !Object.hasOwn(LANGUAGES, value)) return reply(`Unknown language "${value}". Supported: ${LANGUAGE_LIST}.`)
+    if (value) setPreference('lang', value)
+    const code = state.preferences[chatId]?.lang || DEFAULT_PREFERENCES.lang, l = LANGUAGES[code] || LANGUAGES.en
+    await reply(`Digest language${value ? ' set to' : ':'} ${l.name}${l.native !== l.name ? ` (${l.native})` : ''}.${value ? '' : ` Use /lang followed by one of: ${LANGUAGE_LIST}.`}`)
   } else if (command === '/place') {
     if (value === 'world' || value === 'indonesia') setPreference('place', value)
     await reply(`Digest place: ${state.preferences[chatId]?.place || DEFAULT_PREFERENCES.place}. Use /place world or /place Indonesia.`)

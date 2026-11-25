@@ -48,7 +48,7 @@ headlines with source links, without copying descriptions into summaries.
 | `/pro` | Show the Free and Pro plans |
 | `/alerts on\|off` | Toggle breaking-news alerts |
 | `/topics` | Set priority categories (or `all`) |
-| `/lang en\|id` | Set digest language |
+| `/lang CODE` | Set digest language: `en`, `id`, `ru`, `zh`, `es`, `fr`, `de`, `ja`, `ar` or `pt` (see [Languages](#languages)) |
 | `/place world\|Indonesia` | Set geographic priority |
 | `/pair CODE` | Link your glasses in a private chat |
 | `/sources` | List news feeds |
@@ -56,6 +56,28 @@ headlines with source links, without copying descriptions into summaries.
 
 Every bot message is sent as plain text (no `parse_mode`), because the
 AI-written digest can contain stray Markdown characters.
+
+## Languages
+
+`/lang CODE` sets the digest language for a chat. The digest is written in
+English and translated by GLM on the 0G router; the header and the
+"Updated" date follow the language too.
+
+| Code | Language | Digest header | Date locale |
+| --- | --- | --- | --- |
+| `en` | English | News Digest | en-GB |
+| `id` | Indonesian | Ringkasan Berita | id-ID |
+| `ru` | Russian | Новостной дайджест | ru-RU |
+| `zh` | Chinese (Simplified) | 新闻摘要 | zh-CN |
+| `es` | Spanish | Resumen de noticias | es-ES |
+| `fr` | French | Résumé de l’actualité | fr-FR |
+| `de` | German | Nachrichtenüberblick | de-DE |
+| `ja` | Japanese | ニュースダイジェスト | ja-JP |
+| `ar` | Arabic | موجز الأخبار | ar-EG |
+| `pt` | Portuguese | Resumo de notícias | pt-BR |
+
+Any other code gets a reply listing these ten. Bot replies other than the
+digest itself stay in English.
 
 ## Plans
 
@@ -66,7 +88,7 @@ AI-written digest can contain stray Markdown characters.
 | Saved stories | Yes | Unlimited |
 | Topics | Yes | Unlimited |
 | Paired glasses | 1 | Up to 3 devices |
-| Languages | English + Indonesian | English + Indonesian |
+| Languages | 10 digest languages | 10 digest languages |
 | New features | — | Early access |
 
 Payment is not wired up yet (coming soon). `/pro` shows these plans in
@@ -138,10 +160,11 @@ The lead goes first in the digest, with at least one hour between alerts
 and no repeat alerts for matching stories for 48 hours.
 
 Use `/topics TECH, SCIENCE` (or `/topics all` to reset), `/place Indonesia`
-(or `/place world`), and `/lang en` or `/lang id`. The digest keeps the
+(or `/place world`), and `/lang ru` (any code from [Languages](#languages)). The digest keeps the
 breaking lead first and prioritizes matching places and categories when
-the feeds carry them. Indonesian text is translated from the same digest;
-if translation fails, the API flags the English fallback.
+the feeds carry them. Non-English digests are translated from the same
+digest by GLM, cached per language; if translation fails, the chat gets
+the English digest with a note and the API flags the fallback.
 
 #### Glasses pairing API
 
@@ -154,7 +177,7 @@ if translation fails, the API flags the English fallback.
 3. Use `GET /api/digest?device=<uuid>` to get that chat's digest. Unpaired
    devices and requests without a device receive the global digest. For a
    paired device the response adds `lang` and, on fallback,
-   `translationUnavailable: true`.
+   `translationUnavailable: true` with `requestedLang`.
 4. Include the same `device` in the `POST /api/save` JSON object to deliver
    to only the paired chat. An unpaired device supplied to save is rejected;
    omitting the device keeps the legacy broadcast to linked chats.

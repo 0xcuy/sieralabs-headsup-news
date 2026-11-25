@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
 process.env.STATE_DIR = await mkdtemp(join(tmpdir(), 'headsup-test-'))
-const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, savedMessage, splitMessage, server } = await import('./server.mjs')
+const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, savedMessage, splitMessage, server, LANGUAGES, translateDigest, digestMessage } = await import('./server.mjs')
 
 const now = Date.now()
 const hour = 60 * 60 * 1000
@@ -215,4 +215,86 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assert.equal(state.devices[device], 2)
   assert.deepEqual(state.saved.map(({ chats, headline }) => ({ chats, headline })), [{ chats: [2], headline: lead.title }, { chats: [2], headline: lead.title }])
   assert.deepEqual(state.preferences[2], { alerts: false, place: 'indonesia', topics: ['SCIENCE'], lang: 'id' })
+})
+
+const mockModelAndTelegram = (t, sent, prompts, failFor) => t.mock.method(globalThis, 'fetch', async (url, options) => {
+  const host = new URL(url).hostname
+  if (host === 'api.telegram.org') { sent.push(JSON.parse(options.body)); return Response.json({ ok: true }) }
+  assert.equal(host, 'router-api.0g.ai')
+  const prompt = JSON.parse(options.body).messages[0].content
+  prompts.push(prompt)
+  const target = prompt.match(/^Translate each headline and summary into (.+?)\. /)[1]
+  if (target === failFor) return new Response('down', { status: 500 })
+  const rows = JSON.parse(prompt.split('\n').at(-1)).map(row => ({ ...row, headline: `[${target}] ${row.headline}`, summary: row.summary && `[${target}] ${row.summary}` }))
+  return Response.json({ choices: [{ message: { content: JSON.stringify(rows) } }] })
+})
+
+test('/lang accepts the 10 supported codes and lists them on invalid input', async t => {
+  const sent = [], prompts = []
+  mockModelAndTelegram(t, sent, prompts)
+  const bot = text => handleUpdate({ message: { chat: { id: 30, type: 'private' }, text } })
+  assert.deepEqual(Object.keys(LANGUAGES), ['en', 'id', 'ru', 'zh', 'es', 'fr', 'de', 'ja', 'ar', 'pt'])
+  await bot('/lang RU')
+  assert.equal(sent.at(-1).text, 'Digest language set to Russian (Русский).')
+  await bot('/lang zh')
+  assert.equal(sent.at(-1).text, 'Digest language set to Chinese (Simplified) (简体中文).')
+  for (const code of Object.keys(LANGUAGES)) {
+    await bot(`/lang ${code}`)
+    assert.match(sent.at(-1).text, new RegExp(`^Digest language set to ${LANGUAGES[code].name.replace(/[()]/g, '\\$&')}`))
+  }
+  await bot('/lang ru')
+  for (const bad of ['xx', 'russian', 'en id']) {
+    await bot(`/lang ${bad}`)
+    assert.equal(sent.at(-1).text, `Unknown language "${bad}". Supported: en English, id Indonesian, ru Russian, zh Chinese (Simplified), es Spanish, fr French, de German, ja Japanese, ar Arabic, pt Portuguese.`)
+  }
+  await bot('/lang')
+  assert.match(sent.at(-1).text, /^Digest language: Russian \(Русский\)\. Use \/lang followed by one of: en English, .*pt Portuguese\.$/)
+  await bot('/help')
+  assert.match(sent.at(-1).text, /^\/lang en\|id\|ru\|zh\|es\|fr\|de\|ja\|ar\|pt — /m)
+  assert.equal(prompts.length, 0)
+  assert.ok(sent.every(message => !Object.hasOwn(message, 'parse_mode')))
+})
+
+test('translateDigest targets each language and keeps a separate cache per language', async t => {
+  const sent = [], prompts = []
+  mockModelAndTelegram(t, sent, prompts)
+  const stories = [{ id: 'a', headline: 'Rates cut', summary: 'The bank cut rates.', source: 'BBC', url: 'https://example.test/a' }, { id: 'b', headline: 'Storm hits', summary: '', source: 'Guardian', url: 'https://example.test/b' }]
+  const ru = await translateDigest(stories, 'ru')
+  assert.deepEqual(ru.map(s => [s.headline, s.summary]), [['[Russian] Rates cut', '[Russian] The bank cut rates.'], ['[Russian] Storm hits', '']])
+  assert.equal(ru[0].url, stories[0].url)
+  assert.equal(await translateDigest(stories, 'ru'), ru)
+  assert.equal(prompts.length, 1)
+  const zh = await translateDigest(stories, 'zh')
+  assert.match(prompts.at(-1), /^Translate each headline and summary into Simplified Chinese\./)
+  assert.deepEqual(zh.map(s => s.headline), ['[Simplified Chinese] Rates cut', '[Simplified Chinese] Storm hits'])
+  assert.equal(await translateDigest(stories, 'ru'), ru)
+  assert.equal(await translateDigest(stories, 'zh'), zh)
+  assert.equal(prompts.length, 2)
+  const id = await translateDigest(stories, 'id')
+  assert.equal(id[0].headline, '[Bahasa Indonesia] Rates cut')
+  const fresh = stories.map(s => ({ ...s }))
+  assert.equal((await translateDigest(fresh, 'ru'))[0].headline, '[Russian] Rates cut')
+  assert.equal(prompts.length, 4)
+})
+
+test('digest header, date locale and English fallback follow the chat language', async t => {
+  const sent = [], prompts = []
+  mockModelAndTelegram(t, sent, prompts, 'German')
+  const stories = [{ headline: 'Rates cut', summary: 'The bank cut rates.', source: 'BBC', url: 'https://example.test/a' }]
+  const updatedAt = '2026-11-25T15:00:00.000Z'
+  const headers = Object.fromEntries(Object.keys(LANGUAGES).map(lang => [lang, digestMessage({ stories, updatedAt, lang }).split('\n').slice(0, 2)]))
+  assert.deepEqual(headers.ru, ['📰 Heads Up — Новостной дайджест', 'Обновлено 25.11.2026, 22:00:00 WIB'])
+  assert.deepEqual(headers.zh, ['📰 Heads Up — 新闻摘要', '更新于 2026/11/25 22:00:00 WIB'])
+  assert.deepEqual(headers.en, ['📰 Heads Up — News Digest', 'Updated 25/11/2026, 22:00:00 WIB'])
+  assert.equal(new Set(Object.values(headers).map(([title]) => title)).size, 10)
+  for (const [lang, [, updated]] of Object.entries(headers)) assert.ok(updated.startsWith(`${LANGUAGES[lang].updated} `), lang)
+  const bot = text => handleUpdate({ message: { chat: { id: 31, type: 'private' }, text } })
+  await bot('/lang ja')
+  await bot('/digest')
+  assert.match(sent.at(-1).text, /^📰 Heads Up — ニュースダイジェスト\n更新 .+ WIB\n\n1\. \[Japanese\] /)
+  t.mock.method(console, 'error', () => {})
+  await bot('/lang de')
+  await bot('/digest')
+  assert.match(sent.at(-1).text, /^📰 Heads Up — News Digest\nUpdated .+ WIB\nGerman translation unavailable; showing English\.\n\n1\. (?!\[)/)
+  assert.ok(sent.every(message => !Object.hasOwn(message, 'parse_mode')))
 })
