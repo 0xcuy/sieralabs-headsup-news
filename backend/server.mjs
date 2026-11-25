@@ -453,9 +453,13 @@ export async function handleUpdate(u) {
     const wait = refreshWait(manualRefreshAt.get(chatId))
     if (wait) return reply(`You can refresh again in ${wait}. The digest also refreshes every 30 min.`)
     manualRefreshAt.set(chatId, Date.now())
-    const ok = await refreshDigest('telegram')
-    if (!ok) await reply('Could not fetch fresh news right now. Here is the latest digest.')
-    await reply(digestMessage(await personalDigest(chatId)))
+    await reply('Refreshing now. Your new digest will follow in a moment.')
+    // Detached so a slow refresh does not hold up other chats' commands in pollLoop.
+    void refreshDigest('telegram').then(async ok => {
+      if (!ok) await reply('Could not fetch fresh news right now. Here is the latest digest.')
+      await reply(digestMessage(await personalDigest(chatId)))
+    }).catch(e => console.error('[tg] /refresh failed', chatId, e.message))
+
   } else if (command === '/pro') {
     await reply(PRO)
   } else if (command === '/sources') {

@@ -183,7 +183,10 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assert.match(sent.at(-1).text, /^No saved stories yet/)
   await bot(2, '/saved')
   assert.match(sent.at(-1).text, new RegExp(`^🔖 Saved stories\n\n1\. ${lead.title}\nBBC\n`))
+  const updatesSent = sent.length
   await bot(2, '/refresh')
+  assert.equal(sent.at(-1).text, 'Refreshing now. Your new digest will follow in a moment.')
+  for (let i = 0; i < 200 && !(sent.length > updatesSent + 1 && sent.at(-1).text.startsWith('📰')); i++) await new Promise(resolve => setTimeout(resolve, 10))
   const refreshed = await digests(device)
   assert.notEqual(refreshed.updatedAt, personalized.updatedAt)
   assert.equal(refreshed.stories[0].id, personalized.stories[0].id)
