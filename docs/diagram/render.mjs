@@ -111,13 +111,13 @@ const SERVICES = [
   ["app-window", "G2 app", "g2-app/src/main.ts · on the glasses", ["One story at a time, 576 × 288", "Next, Save to Telegram, Voice", "Reloads the digest every 5 min"], "glasses", "Even Hub SDK · glasses bridge"],
   ["route", "Traefik", "on the SIERA VPS", ["TLS for headsup.sieralabs.com", "Routes to the droplet over Tailscale", "Forwards to port :8787"], "network", "Tailscale · VPS to droplet"],
   ["server", "Telegram bot backend", "backend/server.mjs", ["Node ≥ 22, zero npm dependencies", "On the 32GB droplet, port :8787", "State in state.json"], "send", "Telegram Bot API · @HeadsUpNewsBot"],
-  ["audio-lines", "Voice poller", "voice-poller/deepgram_poller.py", ["Runs on the Muse VM", "Holds the Deepgram credential", "Posts transcripts back"], "audio-waveform", "Deepgram · nova-2"],
+  ["audio-lines", "Voice poller", "voice-poller/deepgram_poller.py", ["Runs on the 32GB droplet", "Deepgram key in a mode-600 file", "Posts transcripts back"], "audio-waveform", "Deepgram · nova-2"],
 ];
 const THIRD = [
   ["send", "Telegram Bot API", "api.telegram.org", ["getUpdates long polling, 25 s", "sendMessage, plain text only", "Digests, saves, breaking alerts"]],
   ["rss", "RSS feeds", "public feeds, every 30 min", ["BBC World, The Guardian World", "Al Jazeera, The Verge", "Title and description only"]],
-  ["sparkles", "0G Compute router", "router-api.0g.ai · glm-5.3-flash", ["Picks and rewrites 8 stories", "Headlines ≤ 10 words, summaries ≤ 18", "Indonesian for /lang id"]],
-  ["audio-waveform", "Deepgram", "api.deepgram.com · nova-2", ["Speech to text for ~4 s clips", "next, save this, repeat", "Stored key rejected: INVALID_AUTH"]],
+  ["sparkles", "0G Compute router", "router-api.0g.ai · glm-5.3-flash", ["Picks and rewrites 8 stories", "Headlines ≤ 10 words, summaries ≤ 18", "10 languages via /lang"]],
+  ["audio-waveform", "Deepgram", "api.deepgram.com · nova-2", ["Speech to text for ~4 s clips", "next, save this, repeat", "Called only by the voice poller"]],
 ];
 const PLANNED = [
   ["link", "Pair the glasses", "g2-app + backend", ["Keep a UUID v4 device id", "Show the /api/pair/start code", "Send ?device= on digest and save"]],
@@ -127,13 +127,15 @@ const PLANNED = [
 ];
 const PLATFORMS = [
   ["glasses", "Even Realities G2"], ["app-window", "Even Hub"], ["send", "Telegram"], ["server", "Node.js ≥ 22"],
-  ["route", "SIERA VPS"], ["cpu", "32GB droplet"], ["audio-lines", "Muse VM"],
+  ["cloud", "Cloudflare"], ["route", "SIERA VPS"], ["cpu", "32GB droplet"],
 ];
 
 function architecture(t) {
-  const W = 1664, H = 1128;
-  const M = 48, LW = 320, G = (W - 2 * M - 4 * LW) / 3;
-  const L = [0, 1, 2, 3].map((i) => M + i * (LW + G)), cx = L.map((x) => x + LW / 2);
+  const W = 1878, H = 1128;
+  // The first gap is wider: it holds the Cloudflare hop between the G2 app and Traefik.
+  const M = 48, LW = 320, G = 96, GCF = 310, CFW = 170, GAPS = [GCF, G, G];
+  const L = [M]; for (const gp of GAPS) L.push(L.at(-1) + LW + gp);
+  const cx = L.map((x) => x + LW / 2);
   const Y = { user: 32, uh: 72, p1: 178, s: 214, sh: 190, p2: 568, o: 604, oh: 148, p3: 806, pl: 842, plh: 148 };
   const sBot = Y.s + Y.sh, oMid = Y.o + Y.oh / 2;
 
@@ -148,6 +150,11 @@ function architecture(t) {
     </div>`;
   const services = SERVICES.map(([ic, ti, su, bl, chipIc, chip], i) =>
     card("ours", `s${i}`, L[i], Y.s, Y.sh, ic, ti, su, bl, `<div style="margin-top:13px"><span class="chip">${icon(chipIc, t.muted, 16)}${esc(chip)}</span></div>`)).join("");
+  const cfX = L[0] + LW + 105, cfH = 72;
+  const cf = `
+    <div class="card third" data-box data-id="cf" style="left:${cfX}px;top:${Y.s + 74 - cfH / 2}px;width:${CFW}px;height:${cfH}px;padding:16px 12px">
+      <div class="head"><div class="ic third">${icon("cloud", t.third, 20)}</div><div class="tt"><div class="title">Cloudflare</div><div class="sub">proxied DNS</div></div></div>
+    </div>`;
   const third = THIRD.map(([ic, ti, su, bl], i) => card("third", `o${i}`, L[i], Y.o, Y.oh, ic, ti, su, bl)).join("");
   const planned = PLANNED.map(([ic, ti, su, bl], i) => card("plan", `p${i}`, L[i], Y.pl, Y.plh, ic, ti, su, bl, "", `<span class="tag">Planned</span>`)).join("");
 
@@ -172,7 +179,8 @@ function architecture(t) {
   const wires = [
     { d: `M${L[0]} ${Y.user + Y.uh / 2} L18 ${Y.user + Y.uh / 2} L18 ${oMid} L${L[0] - 2} ${oMid}`, from: "u0", to: "o0" },
     { d: `M${wearX} ${Y.user + Y.uh} L${wearX} ${jogY} L${appX} ${jogY} L${appX} ${Y.s - 3}`, from: "u1", to: "s0" },
-    { d: `M${gapX(0)} ${midY} L${L[1] - 2} ${midY}`, from: "s0", to: "s1" },
+    { d: `M${gapX(0)} ${midY} L${cfX - 2} ${midY}`, from: "s0", to: "cf" },
+    { d: `M${cfX + CFW} ${midY} L${L[1] - 2} ${midY}`, from: "cf", to: "s1" },
     { d: `M${gapX(1)} ${midY} L${L[2] - 2} ${midY}`, from: "s1", to: "s2" },
     { d: `M${L[3]} ${midY} L${gapX(2) + 2} ${midY}`, from: "s3", to: "s2" },
     { d: `M${tgX} ${sBot} L${tgX} ${laneTg} L${tgEnd} ${laneTg} L${tgEnd} ${Y.o - 3}`, from: "s2", to: "o0" },
@@ -181,7 +189,7 @@ function architecture(t) {
     { d: `M${cx[3]} ${sBot} L${cx[3]} ${Y.o - 3}`, from: "s3", to: "o3" },
   ];
   const lab = (id, x, y, lines, center = false) => `<div class="label" data-box data-id="${id}" style="left:${x}px;top:${y}px;${center ? "transform:translateX(-50%);text-align:center;" : ""}">${lines.map(esc).join("<br>")}</div>`;
-  const g = (i) => gapX(i) + G / 2;
+  const g = (i) => (i === 0 ? gapX(0) + 105 / 2 : gapX(i) + G / 2);
   const labels = [
     lab("lu0", 30, Y.user + Y.uh + 12, ["Telegram app:", "/digest, /saved, /pair CODE"]),
     lab("lu1", wearX + 12, Y.user + Y.uh + 12, ["ring, tap, voice"]),
@@ -205,7 +213,7 @@ function architecture(t) {
     ${panel("pt1", Y.p1, Y.sh + 56, "Run by SIERA")}
     ${panel("pt2", Y.p2, Y.oh + 56, "Third-party services")}
     ${panel("pt3", Y.p3, Y.plh + 56, "Planned hardening · not built yet")}
-    ${svg}${users}${services}${third}${planned}${labels}${chips}${legend}
+    ${svg}${users}${services}${cf}${third}${planned}${labels}${chips}${legend}
   </body></html>`;
   return { W, H, html };
 }

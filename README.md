@@ -41,7 +41,7 @@ headlines with source links, without copying descriptions into summaries.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
-  <img alt="Heads Up News architecture. Users: a Telegram user in their own chat with the bot, and a G2 glasses wearer using ring + tap, voice and save to Telegram. Run by SIERA: the G2 app (g2-app/src/main.ts, on the glasses, Even Hub SDK) calls headsup.sieralabs.com over HTTPS for /api/digest, /api/save and /api/voice; Traefik on the SIERA VPS terminates TLS and routes over Tailscale to port 8787 on the 32GB droplet; the Telegram bot backend (backend/server.mjs, Node 22 or later, zero npm dependencies, state in state.json) runs there; the voice poller (voice-poller/deepgram_poller.py) runs on the Muse VM, holds the Deepgram credential, polls the droplet directly on port 8787 for voice jobs and posts transcripts back. Third-party services: the Telegram Bot API (getUpdates long polling, sendMessage as plain text), which Telegram users reach with /digest, /saved and /pair CODE; the RSS feeds of BBC World, The Guardian World, Al Jazeera and The Verge, read every 30 minutes; the 0G Compute router with glm-5.3-flash for the digest and Indonesian translation; and Deepgram nova-2 speech to text, whose stored key is currently rejected with INVALID_AUTH. Planned hardening, not built yet: pair the glasses (device id, /api/pair/start code, ?device=), a shared secret for the voice relay, atomic state writes with state.json.bak, and a paired device for /api/save plus a rate limit on /api/refresh." src="docs/architecture-light.png">
+  <img alt="Heads Up News architecture. Users: a Telegram user in their own chat with the bot, and a G2 glasses wearer using ring + tap, voice and save to Telegram. Run by SIERA: the G2 app (g2-app/src/main.ts, on the glasses, Even Hub SDK) calls headsup.sieralabs.com over HTTPS for /api/digest, /api/save and /api/voice, through Cloudflare (proxied DNS) to Traefik; Traefik on the SIERA VPS terminates TLS and routes over Tailscale to port 8787 on the 32GB droplet; the Telegram bot backend (backend/server.mjs, Node 22 or later, zero npm dependencies, state in state.json) runs there; the voice poller (voice-poller/deepgram_poller.py) also runs on the 32GB droplet, reads the Deepgram key from a mode-600 file, polls the backend directly on port 8787 for voice jobs and posts transcripts back. Third-party services: the Telegram Bot API (getUpdates long polling, sendMessage as plain text), which Telegram users reach with /digest, /saved and /pair CODE; the RSS feeds of BBC World, The Guardian World, Al Jazeera and The Verge, read every 30 minutes; the 0G Compute router with glm-5.3-flash for the digest and translation into 10 languages via /lang; and Deepgram nova-2 speech to text, called only by the voice poller. Planned hardening, not built yet: pair the glasses (device id, /api/pair/start code, ?device=), a shared secret for the voice relay, atomic state writes with state.json.bak, and a paired device for /api/save plus a rate limit on /api/refresh." src="docs/architecture-light.png">
 </picture>
 
 The diagram shows what runs today; the four amber cards are planned and
@@ -124,8 +124,8 @@ g2-app/              Even Hub app (Vite + TypeScript + @evenrealities/even_hub_s
                      2 text containers (header, story) + 1 action list.
                      Also renders a DOM mirror for plain-browser preview.
 voice-poller/        Deepgram STT poller (Python, stdlib only). Runs on the
-                     Muse VM, where the Deepgram credential lives; polls the
-                     droplet for voice jobs and posts transcripts back.
+                     32GB droplet with a file-based Deepgram key; polls the
+                     backend for voice jobs and posts transcripts back.
 ```
 
 ## Setup
@@ -183,25 +183,20 @@ Use HTTPS and keep the device UUID private. Do not expose or include it in
 telemetry. A paired UUID cannot be reassigned; generate a new UUID to pair
 again.
 
-### Voice relay (Deepgram STT) — runs on the Muse VM, not the droplet
+### Voice relay (Deepgram STT) — the poller runs on the 32GB droplet
 
-The Deepgram API key is held by the Muse VM (`custom.deepgram` via authd
-surrogates), and the surrogate is only substituted with the real key on VM
-egress — so the droplet backend cannot call Deepgram itself, and no key
-(raw or surrogate) is ever written to the droplet, an env var, or the
-backend source. Voice is therefore an async job queue:
+The live poller runs on the droplet as
+`/usr/bin/python3 /root/headsup/voice-poller/deepgram_poller.py` and reads
+the Deepgram API key from `/root/.config/deepgram/api-key` (mode 600). The
+backend never calls Deepgram itself; voice is an async job queue:
 
 - The G2 app POSTs the mic clip (16 kHz 16-bit mono PCM in a WAV) to
   `POST /api/voice` and polls `GET /api/voice/:jobId`.
-- `voice-poller/deepgram_poller.py` (stdlib-only Python) polls the droplet
-  for jobs, transcribes each clip with Deepgram `nova-2` (~$0.0003 per
-  4 s clip) from the VM, and POSTs the transcript back. It mints a fresh
-  surrogate per Deepgram call and keeps it only in memory. It must be
-  started from a shell with the runtime proxy env (the VM has no direct
-  egress):
-  ```bash
-  setsid nohup python3 voice-poller/deepgram_poller.py >> voice-poller.log 2>&1 < /dev/null &
-  ```
+- `voice-poller/deepgram_poller.py` (stdlib-only Python) polls the backend
+  directly on `:8787` for jobs (not through `headsup.sieralabs.com`, whose
+  Cloudflare bot protection returns 403 to bare urllib requests),
+  transcribes each clip with Deepgram `nova-2` (~$0.0003 per 4 s clip), and
+  POSTs the transcript back.
 - If the poller hasn't checked in for 20 s, `POST /api/voice` fails fast
   with `503 voice_unavailable` and the glasses say voice is offline —
   ring + tap are unaffected.
@@ -265,12 +260,9 @@ The app fetches its digest from the backend URL in `src/main.ts`
   can't message a chat that never talked to them). — Done: the user has
   pressed `/start`; saves now deliver.
 - The backend is served over TLS at `https://headsup.sieralabs.com`
-  (Traefik on the SIERA VPS → droplet over Tailscale).
-- Voice (Deepgram STT) is wired end-to-end, with two honest limits:
-  - The stored Deepgram credential is currently rejected by Deepgram
-    (`INVALID_AUTH` on a request that provably carried the surrogate).
-    A reconnect is needed: re-enter a valid Deepgram API key, then re-test
-    transcription with a recorded clip before calling voice done.
+  (Cloudflare → Traefik on the SIERA VPS → droplet over Tailscale).
+- Voice (Deepgram STT) is live since Nov 23: a recorded 1-second clip was
+  transcribed end to end, with no auth error. One honest limit:
   - Live-mic transcription on real G2 hardware is NOT tested yet — the
     simulator has no mic, so it can only prove the wiring up to
     "Mic unavailable". The glasses-mic path (PCM → WAV → queue → Deepgram)
