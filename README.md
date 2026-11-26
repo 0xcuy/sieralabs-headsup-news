@@ -193,7 +193,7 @@ the English digest with a note and the API flags the fallback.
 
 1. Generate and store a random UUID v4 as the private device ID. Send
    `POST /api/pair/start` with JSON `{"device":"<uuid>"}` and display the
-   returned `code` (a four-character string, which may start with zero).
+   returned `code` (a six-digit string, which may start with zero).
    The response contains `expiresAt` in Unix milliseconds. Codes are
    single-use and expire after 10 minutes.
 2. The user sends `/pair <code>` in a private chat with `@HeadsUpNewsBot`.

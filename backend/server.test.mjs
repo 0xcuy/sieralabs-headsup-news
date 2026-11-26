@@ -39,19 +39,19 @@ test('personal ranking keeps breaking first and preserves the global order', () 
 
 test('pair codes have leading zeroes, are unique while active, single-use and expiring', () => {
   let time = now
-  const codes = ['0042', '0042', '0043', '0044']
+  const codes = ['000042', '000042', '000043', '000044']
   const pairs = createPairing(() => time, () => codes.shift())
   const first = pairs.start('device-a')
   assert.deepEqual(pairs.start('device-a'), first)
-  assert.equal(pairs.start('device-b').code, '0043')
-  assert.deepEqual(pairs.claim('0042', 1), { device: 'device-a' })
-  assert.deepEqual(pairs.claim('0042', 1), { error: 'invalid_code' })
-  for (let i = 0; i < 4; i++) pairs.claim('0000', 1)
-  assert.deepEqual(pairs.claim('0043', 1), { error: 'too_many_attempts' })
+  assert.equal(pairs.start('device-b').code, '000043')
+  assert.deepEqual(pairs.claim('000042', 1), { device: 'device-a' })
+  assert.deepEqual(pairs.claim('000042', 1), { error: 'invalid_code' })
+  for (let i = 0; i < 4; i++) pairs.claim('000000', 1)
+  assert.deepEqual(pairs.claim('000043', 1), { error: 'too_many_attempts' })
   time = first.expiresAt
-  assert.deepEqual(pairs.claim('0043', 2), { error: 'invalid_code' })
-  assert.equal(pairs.start('device-c').code, '0044')
-  assert.deepEqual(pairs.claim('0044', 1), { device: 'device-c' })
+  assert.deepEqual(pairs.claim('000043', 2), { error: 'invalid_code' })
+  assert.equal(pairs.start('device-c').code, '000044')
+  assert.deepEqual(pairs.claim('000044', 1), { device: 'device-c' })
 })
 
 test('manual refresh cooldown reports the remaining wait', () => {
@@ -167,7 +167,10 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assert.equal(sent.at(-1).text.startsWith('🔖'), false)
   const start = await api('/api/pair/start', { device })
   const { code } = await start.json()
-  assert.match(code, /^\d{4}$/)
+  assert.match(code, /^\d{6}$/)
+  await bot(2, `/pair ${code.slice(2)}`)
+  assert.equal(sent.at(-1).text, 'Use /pair followed by the six-digit code on your glasses.')
+  assert.deepEqual(await status(device), { ok: true, paired: false })
   await bot(2, `/pair ${code}`)
   assert.match(sent.at(-1).text, /^Glasses paired\./)
   assert.deepEqual(await status(device), { ok: true, paired: true })
@@ -235,7 +238,7 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assert.equal((await api('/api/save', { storyId: global.stories[0].id, device })).status, 409)
   assert.equal(sent.length, beforeUnpairedSave)
   const repair = await (await api('/api/pair/start', { device })).json()
-  assert.match(repair.code, /^\d{4}$/)
+  assert.match(repair.code, /^\d{6}$/)
   await bot(1, `/pair ${repair.code}`)
   assert.deepEqual(await status(device), { ok: true, paired: true })
   assert.equal((await api('/api/save', { storyId: global.stories[0].id, device })).status, 200)

@@ -323,7 +323,7 @@ export function digestMessage({ stories, updatedAt, lang, translationUnavailable
   return `📰 Heads Up — ${l.title}\n${l.updated} ${date} WIB${fallback}\n\n${lines.join('\n\n')}`
 }
 
-export function createPairing(now = Date.now, nextCode = () => String(randomInt(10000)).padStart(4, '0')) {
+export function createPairing(now = Date.now, nextCode = () => String(randomInt(1_000_000)).padStart(6, '0')) {
   const pending = new Map()
   let misses = []
   const chatMisses = new Map()
@@ -454,7 +454,7 @@ export async function handleUpdate(u) {
     await reply(`Digest place: ${state.preferences[chatId]?.place || DEFAULT_PREFERENCES.place}. Use /place world or /place Indonesia.`)
   } else if (command === '/pair') {
     if (msg.chat.type !== 'private') return reply('Send /pair and the code in a private chat with @HeadsUpNewsBot.')
-    if (!/^\d{4}$/.test(value)) return reply('Use /pair followed by the four-digit code on your glasses.')
+    if (!/^\d{6}$/.test(value)) return reply('Use /pair followed by the six-digit code on your glasses.')
     const { device, error } = pairing.claim(value, chatId)
     if (error === 'too_many_attempts') return reply('Too many pairing attempts. Wait a few minutes and request a new code.')
     if (!device) return reply('That code is invalid or expired. Request a code on your glasses.')
