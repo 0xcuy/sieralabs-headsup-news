@@ -7,6 +7,11 @@
 // by Whisper on the backend). Double-tap anywhere exits. Digest comes from
 // the Heads Up backend (RSS -> GLM digest -> JSON API).
 //
+// Pairing: the app makes a random device id once and keeps it in the
+// Even Hub local storage. Until a Telegram chat claims it, the header shows
+// a four-digit code for "/pair CODE" in @HeadsUpNewsBot; once paired, the
+// digest is that chat's personal digest and saves go only to that chat.
+//
 // SDK rule (README): exactly ONE container may have isEventCapture=1 —
 // the action list owns it; the text containers are display-only.
 
@@ -20,7 +25,7 @@ import {
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
 
-const API_BASE = 'https://headsup.sieralabs.com'
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) || 'https://headsup.sieralabs.com'
 const HEADER_ID = 1
 const STORY_ID = 2
 const ACTIONS_ID = 3
@@ -28,6 +33,11 @@ const ACTIONS_ID = 3
 const ACTION_NEXT = 0
 const ACTION_SAVE = 1
 const ACTION_VOICE = 2
+
+const DEVICE_KEY = 'headsup.device'
+const DEVICE_ID = /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i
+const PAIR_POLL_MS = 5000 // while a code is on screen
+const PAIRED_POLL_MS = 60000 // notice an /unpair from Telegram
 
 // Voice: the SDK mic delivers 16kHz signed 16-bit little-endian mono PCM
 // (simulator spec — 100ms / 3200 bytes per audioEvent; the real G2 mic
@@ -53,6 +63,12 @@ let updatedAt = ''
 let saveFlash = ''
 let bridge: Awaited<ReturnType<typeof waitForEvenAppBridge>> | null = null
 
+let device = ''
+let paired: boolean | null = null // null until the backend has answered
+let pairCode = ''
+let pairExpiresAt = 0
+let pairTimer: number | null = null
+
 // Voice capture state. Listening is additive: ring + tap keep working the
 // whole time, and any failure here only flashes a hint — it never touches
 // the story list or the save path.
@@ -71,8 +87,13 @@ function timeLabel(iso: string): string {
   }
 }
 
+function pairHint(): string {
+  return pairCode ? `send /pair ${pairCode} to @HeadsUpNewsBot` : 'open @HeadsUpNewsBot in Telegram'
+}
+
 function headerText(): string {
   if (saveFlash) return saveFlash
+  if (paired === false) return `PAIR GLASSES · ${pairHint()}`
   const n = stories.length
   return n === 0 ? 'HEADS UP · NEWS' : `HEADS UP · NEWS   ${n} stories · ${timeLabel(updatedAt)}`
 }
@@ -99,6 +120,7 @@ function renderDomFallback() {
   domApp.innerHTML = `
     <div style="text-align:left;max-width:520px">
       <div style="opacity:.7;font-size:13px">${headerText()}</div>
+      ${paired === false && pairCode ? `<div style="margin:10px 0;padding:8px;border:1px solid #4ade9f;border-radius:6px">Pair these glasses: send <b>/pair ${pairCode}</b> to @HeadsUpNewsBot in a private chat.</div>` : ''}
       <h2 style="margin:12px 0 6px">${index + 1}/${stories.length} · ${s.category} — ${s.source}</h2>
       <div style="font-size:20px;font-weight:700">${s.headline}</div>
       <p style="font-size:15px">${s.summary}</p>
@@ -164,18 +186,24 @@ function nextStory() {
 async function saveCurrent(viaVoice = false) {
   if (stories.length === 0) return
   const s = stories[index]
+  if (!device) { flash('Save failed — try again'); return }
+  if (paired === false) { flash(`Pair first: ${pairHint()}`); return }
   flash('Saving…')
   try {
     const res = await fetch(`${API_BASE}/api/save`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ storyId: s.id }),
+      body: JSON.stringify({ storyId: s.id, device }),
     })
     const data = await res.json()
     if (res.ok && data.ok) {
       flash(viaVoice ? '🎤 ★ SAVED — sent to your Telegram' : '★ SAVED — sent to your Telegram')
-    } else if (res.status === 409) {
-      flash('Open Telegram → /start @HeadsUpNewsBot first')
+    } else if (data.error === 'device_not_paired') {
+      await setPaired(false)
+      flash(`Pair first: ${pairHint()}`)
+    } else if (data.error === 'story_not_found') {
+      flash('Story rotated out — refreshing')
+      void loadDigest()
     } else {
       flash('Save failed — try again')
     }
@@ -261,7 +289,7 @@ function handleVoiceResult(data: { ok?: boolean; transcript?: string; command?: 
 }
 
 // Voice is async: the clip is queued on the backend (POST /api/voice
-// returns a jobId) and a poller on the Muse VM transcribes it with Deepgram
+// returns a jobId) and a poller on the droplet transcribes it with Deepgram
 // and posts the transcript back. Poll for the result for up to ~15s.
 const VOICE_POLL_MS = 1000
 const VOICE_POLL_MAX = 15
@@ -352,19 +380,107 @@ async function startListening() {
   listenTimer = window.setTimeout(() => stopListening(), VOICE_WINDOW_MS)
 }
 
+// ---------- Device identity + pairing ----------
+
+function newDeviceId(): string {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const b = crypto.getRandomValues(new Uint8Array(16))
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = [...b].map(x => x.toString(16).padStart(2, '0')).join('')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+// Generated once, then read back on every launch: the Even Hub local
+// storage on the glasses, window.localStorage in a plain browser.
+async function loadDeviceId(): Promise<string> {
+  let stored = ''
+  try { stored = bridge ? await bridge.getLocalStorage(DEVICE_KEY) : '' } catch { /* host without storage */ }
+  if (!DEVICE_ID.test(stored || '')) {
+    try { stored = window.localStorage.getItem(DEVICE_KEY) || '' } catch { stored = '' }
+  }
+  const id = DEVICE_ID.test(stored) ? stored.toLowerCase() : newDeviceId()
+  try { if (bridge) await bridge.setLocalStorage(DEVICE_KEY, id) } catch { /* best effort */ }
+  try { window.localStorage.setItem(DEVICE_KEY, id) } catch { /* best effort */ }
+  return id
+}
+
+async function requestPairCode() {
+  try {
+    const res = await fetch(`${API_BASE}/api/pair/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ device }),
+    })
+    const data = await res.json()
+    if (res.ok && data.code) {
+      pairCode = data.code
+      pairExpiresAt = data.expiresAt || Date.now() + 10 * 60 * 1000
+    } else if (data.error === 'device_already_paired') {
+      await setPaired(true, true)
+      return
+    }
+  } catch (e) {
+    console.error('Pair code request failed:', e)
+  }
+  await refresh()
+}
+
+function schedulePairPoll() {
+  if (pairTimer !== null) window.clearTimeout(pairTimer)
+  pairTimer = window.setTimeout(() => void pollPairing(), paired ? PAIRED_POLL_MS : PAIR_POLL_MS)
+}
+
+async function pollPairing() {
+  pairTimer = null
+  try {
+    const res = await fetch(`${API_BASE}/api/pair/status?device=${device}`)
+    const data = await res.json()
+    if (typeof data.paired === 'boolean' && data.paired !== paired) await setPaired(data.paired, true)
+    else if (paired === false && (!pairCode || Date.now() >= pairExpiresAt)) await requestPairCode()
+  } catch {
+    // Offline: keep the last code on screen and try again.
+  }
+  schedulePairPoll()
+}
+
+async function setPaired(next: boolean, reload = false) {
+  const was = paired
+  paired = next
+  if (next) {
+    pairCode = ''
+    pairExpiresAt = 0
+    if (was === false) flash('✓ PAIRED — showing your Telegram digest')
+  } else if (!pairCode || Date.now() >= pairExpiresAt) {
+    await requestPairCode()
+  }
+  if (reload && was !== null) {
+    index = 0
+    await loadDigest()
+  }
+  schedulePairPoll()
+}
+
 async function loadDigest() {
   try {
-    const res = await fetch(`${API_BASE}/api/digest`)
+    const res = await fetch(`${API_BASE}/api/digest${device ? `?device=${device}` : ''}`)
     const data = await res.json()
     if (Array.isArray(data.stories) && data.stories.length > 0) {
       stories = data.stories
       updatedAt = data.updatedAt || ''
       if (index >= stories.length) index = 0
     }
+    if (device && typeof data.paired === 'boolean' && data.paired !== paired) await setPaired(data.paired)
   } catch (e) {
     console.error('Digest fetch failed:', e)
   }
   await refresh()
+}
+
+async function boot() {
+  device = await loadDeviceId()
+  await loadDigest()
+  window.setInterval(() => void loadDigest(), 5 * 60 * 1000)
 }
 
 // Reads the event type out of one envelope.
@@ -462,21 +578,26 @@ async function startGlasses() {
 
 // Boot: try the glasses bridge; if it never appears (plain browser preview),
 // fall back to the DOM mirror so the app is still demoable on screen.
+let booted = false
+function bootOnce() {
+  if (booted) return
+  booted = true
+  void boot()
+}
+
 const bridgeTimer = window.setTimeout(() => {
   console.log('No Even Hub bridge — running DOM fallback preview.')
-  void loadDigest()
-  window.setInterval(() => void loadDigest(), 5 * 60 * 1000)
+  bootOnce()
 }, 3000)
 
 startGlasses()
   .then(() => {
     window.clearTimeout(bridgeTimer)
-    void loadDigest()
-    window.setInterval(() => void loadDigest(), 5 * 60 * 1000)
+    bootOnce()
   })
   .catch(e => {
     console.error('Bridge init failed, DOM fallback:', e)
     window.clearTimeout(bridgeTimer)
-    void loadDigest()
-    window.setInterval(() => void loadDigest(), 5 * 60 * 1000)
+    bridge = null
+    bootOnce()
   })

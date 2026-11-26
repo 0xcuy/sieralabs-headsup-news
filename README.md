@@ -41,11 +41,12 @@ headlines with source links, without copying descriptions into summaries.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
-  <img alt="Heads Up News architecture. Users: a Telegram user in their own chat with the bot, and a G2 glasses wearer using ring + tap, voice and save to Telegram. Run by SIERA: the G2 app (g2-app/src/main.ts, on the glasses, Even Hub SDK) calls headsup.sieralabs.com over HTTPS for /api/digest, /api/save and /api/voice, through Cloudflare (proxied DNS) to Traefik; Traefik on the SIERA VPS terminates TLS and routes over Tailscale to port 8787 on the 32GB droplet; the Telegram bot backend (backend/server.mjs, Node 22 or later, zero npm dependencies, state in state.json) runs there; the voice poller (voice-poller/deepgram_poller.py) also runs on the 32GB droplet, reads the Deepgram key from a mode-600 file, polls the backend directly on port 8787 for voice jobs and posts transcripts back. Third-party services: the Telegram Bot API (getUpdates long polling, sendMessage as plain text), which Telegram users reach with /digest, /saved and /pair CODE; the RSS feeds of BBC World, The Guardian World, Al Jazeera and The Verge, read every 30 minutes; the 0G Compute router with glm-5.3-flash for the digest and translation into 10 languages via /lang; and Deepgram nova-2 speech to text, called only by the voice poller. Planned hardening, not built yet: pair the glasses (device id, /api/pair/start code, ?device=), a shared secret for the voice relay, atomic state writes with state.json.bak, and a paired device for /api/save plus a rate limit on /api/refresh." src="docs/architecture-light.png">
+  <img alt="Heads Up News architecture. Users: a Telegram user in their own chat with the bot, and a G2 glasses wearer using ring + tap, voice and save to Telegram. Run by SIERA: the G2 app (g2-app/src/main.ts, on the glasses, Even Hub SDK) calls headsup.sieralabs.com over HTTPS for /api/digest, /api/save, /api/voice and /api/pair, through Cloudflare (proxied DNS) to Traefik; Traefik on the SIERA VPS terminates TLS and routes over Tailscale to port 8787 on the 32GB droplet; the Telegram bot backend (backend/server.mjs, Node 22 or later, zero npm dependencies, state in state.json) runs there; the voice poller (voice-poller/deepgram_poller.py) also runs on the 32GB droplet, reads the Deepgram key from a mode-600 file, polls the backend directly on port 8787 for voice jobs and posts transcripts back. Third-party services: the Telegram Bot API (getUpdates long polling, sendMessage as plain text), which Telegram users reach with /digest, /saved and /pair CODE; the RSS feeds of BBC World, The Guardian World, Al Jazeera and The Verge, read every 30 minutes; the 0G Compute router with glm-5.3-flash for the digest and translation into 10 languages via /lang; and Deepgram nova-2 speech to text, called only by the voice poller. Hardening: pairing the glasses is built (a UUID v4 device id kept in Even Hub storage, the /pair code shown on the glasses, ?device= on digest and save). Planned, not built yet: a shared secret for the voice relay, atomic state writes with state.json.bak, and a paired device for /api/save plus a rate limit on /api/refresh." src="docs/architecture-light.png">
 </picture>
 
-The diagram shows what runs today; the four amber cards are planned and
-not built yet. It is rendered from HTML by
+The diagram shows what runs today; in the bottom band the green "Built"
+card (glasses pairing) is live code and the three amber cards are planned
+and not built yet. It is rendered from HTML by
 [`docs/diagram/render.mjs`](docs/diagram/render.mjs) (Playwright, Inter,
 Lucide icons), which checks the layout and text contrast before it writes
 the PNGs. To regenerate it:
@@ -71,6 +72,7 @@ stays dependency-free.
 | `/lang CODE` | Set digest language: `en`, `id`, `ru`, `zh`, `es`, `fr`, `de`, `ja`, `ar` or `pt` (see [Languages](#languages)) |
 | `/place world\|Indonesia` | Set geographic priority |
 | `/pair CODE` | Link your glasses in a private chat |
+| `/unpair` | Unlink this chat's glasses; they show a new pairing code |
 | `/sources` | List news feeds |
 | `/help` | List all commands |
 
@@ -165,7 +167,8 @@ chmod 600 /root/.config/0g-router/api-key
 node backend/server.mjs          # listens on :8787
 ```
 
-Endpoints: `GET /health`, `GET /api/digest`, `POST /api/save {storyId, device?}`,
+Endpoints: `GET /health`, `GET /api/digest?device=`, `POST /api/save {storyId, device?}`,
+`POST /api/pair/start {device}`, `GET /api/pair/status?device=`,
 `POST /api/refresh`, plus the voice queue: `POST /api/voice` (audio clip →
 `202 {jobId}`), `GET /api/voice/:jobId` (poll for the transcript + command),
 `GET /api/voice-jobs` and `POST /api/voice-result` (voice poller only).
@@ -194,17 +197,29 @@ the English digest with a note and the API flags the fallback.
    The response contains `expiresAt` in Unix milliseconds. Codes are
    single-use and expire after 10 minutes.
 2. The user sends `/pair <code>` in a private chat with `@HeadsUpNewsBot`.
-3. Use `GET /api/digest?device=<uuid>` to get that chat's digest. Unpaired
-   devices and requests without a device receive the global digest. For a
-   paired device the response adds `lang` and, on fallback,
-   `translationUnavailable: true` with `requestedLang`.
-4. Include the same `device` in the `POST /api/save` JSON object to deliver
-   to only the paired chat. An unpaired device supplied to save is rejected;
-   omitting the device keeps the legacy broadcast to linked chats.
+3. Poll `GET /api/pair/status?device=<uuid>` (returns `{ok, paired}`) until
+   `paired` is `true`; request a new code when the old one expires.
+4. Use `GET /api/digest?device=<uuid>` to get that chat's digest. Unpaired
+   devices and requests without a device receive the global digest. With a
+   valid `device` the response adds `paired`; for a paired device it also
+   adds `lang` and, on fallback, `translationUnavailable: true` with
+   `requestedLang`.
+5. Include the same `device` in the `POST /api/save` JSON object to deliver
+   to only the paired chat. An unpaired device supplied to save gets
+   `409 device_not_paired` and nothing is sent; omitting the device keeps
+   the legacy broadcast to linked chats (the G2 app always sends it).
+6. `/unpair` in the chat removes its glasses; the same UUID can then pair
+   again with a fresh code.
+
+`g2-app/src/main.ts` implements this flow: it keeps the UUID under
+`headsup.device` in Even Hub local storage (browser `localStorage` in the
+DOM preview), shows `PAIR GLASSES · send /pair CODE to @HeadsUpNewsBot` in
+the header while the global digest keeps scrolling, polls every 5 s, and
+flashes `✓ PAIRED` when the chat claims the code.
 
 Use HTTPS and keep the device UUID private. Do not expose or include it in
-telemetry. A paired UUID cannot be reassigned; generate a new UUID to pair
-again.
+telemetry. A paired UUID cannot be claimed by another chat until it is
+unpaired.
 
 ### Voice relay (Deepgram STT) — the poller runs on the 32GB droplet
 
