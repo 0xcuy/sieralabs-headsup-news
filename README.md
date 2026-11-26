@@ -306,6 +306,9 @@ npm run simulate                 # Even Hub simulator -> http://localhost:5173
 On real glasses: `npx evenhub qr --url http://<your-ip>:5173` and scan it
 with the Even Hub companion app. `npm run pack` produces the `.ehpk`.
 
+Download the built app: https://blog.sieralabs.com/headsup-g2-pairing.ehpk
+(install via Even Hub).
+
 The app fetches its digest from the backend URL in `src/main.ts`
 (`API_BASE` — point it at your backend host).
 
