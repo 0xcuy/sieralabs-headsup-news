@@ -59,6 +59,7 @@ const HELP = [
   `/lang ${Object.keys(LANGUAGES).join('|')} — set digest language`,
   '/place world|Indonesia — set geographic priority',
   '/pair CODE — link your glasses in this private chat',
+  '/unpair — unlink the glasses paired to this chat',
   '/saved — list stories you saved from your glasses',
   '/refresh — fetch a fresh digest now',
   '/pro — see Free and Pro plans',
@@ -322,7 +323,7 @@ export function digestMessage({ stories, updatedAt, lang, translationUnavailable
   return `📰 Heads Up — ${l.title}\n${l.updated} ${date} WIB${fallback}\n\n${lines.join('\n\n')}`
 }
 
-export function createPairing(now = Date.now, nextCode = () => String(randomInt(10000)).padStart(4, '0')) {
+export function createPairing(now = Date.now, nextCode = () => String(randomInt(1_000_000)).padStart(6, '0')) {
   const pending = new Map()
   let misses = []
   const chatMisses = new Map()
@@ -453,14 +454,20 @@ export async function handleUpdate(u) {
     await reply(`Digest place: ${state.preferences[chatId]?.place || DEFAULT_PREFERENCES.place}. Use /place world or /place Indonesia.`)
   } else if (command === '/pair') {
     if (msg.chat.type !== 'private') return reply('Send /pair and the code in a private chat with @HeadsUpNewsBot.')
-    if (!/^\d{4}$/.test(value)) return reply('Use /pair followed by the four-digit code on your glasses.')
+    if (!/^\d{6}$/.test(value)) return reply('Use /pair followed by the six-digit code on your glasses.')
     const { device, error } = pairing.claim(value, chatId)
     if (error === 'too_many_attempts') return reply('Too many pairing attempts. Wait a few minutes and request a new code.')
     if (!device) return reply('That code is invalid or expired. Request a code on your glasses.')
     state.devices[device] = chatId
     if (!state.chats.includes(chatId)) state.chats.push(chatId)
     persist()
-    await reply('Glasses paired. They will now show your personal digest.')
+    await reply('Glasses paired. They will now show your personal digest, and stories you save on them come to this chat.')
+  } else if (command === '/unpair') {
+    const paired = Object.keys(state.devices).filter(device => state.devices[device] === chatId)
+    if (paired.length === 0) return reply('No glasses are paired to this chat. Use /pair CODE with the code on your glasses.')
+    for (const device of paired) delete state.devices[device]
+    persist()
+    await reply(`Unpaired ${paired.length === 1 ? 'your glasses' : `${paired.length} glasses`}. They will show a new pairing code.`)
   } else if (command === '/saved') {
     await reply(savedMessage(state.saved, state.digest, chatId, state.chats))
   } else if (command === '/refresh') {
@@ -562,7 +569,13 @@ export const server = createServer(async (req, res) => {
     if (requestedDevice !== null) res.setHeader('cache-control', 'no-store')
     const chatId = state.devices[deviceId(requestedDevice)]
     const digest = chatId === undefined ? { updatedAt: state.updatedAt, stories: state.digest || [] } : await personalDigest(chatId)
-    return jsonResponse(res, 200, digest)
+    return jsonResponse(res, 200, requestedDevice === null ? digest : { ...digest, paired: chatId !== undefined })
+  }
+  if (url.pathname === '/api/pair/status' && req.method === 'GET') {
+    res.setHeader('cache-control', 'no-store')
+    const device = deviceId(url.searchParams.get('device'))
+    if (!device) return jsonResponse(res, 400, { ok: false, error: 'invalid_device' })
+    return jsonResponse(res, 200, { ok: true, paired: Object.hasOwn(state.devices, device) })
   }
   if (url.pathname === '/api/pair/start' && req.method === 'POST') {
     res.setHeader('cache-control', 'no-store')

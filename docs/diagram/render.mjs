@@ -88,6 +88,7 @@ body{position:relative;font-family:InterV,sans-serif;color:${t.ink};-webkit-font
 .sub{font:400 13px/1.25 InterV;color:${t.muted};white-space:nowrap}
 .mono{font:500 12px/1.25 "DejaVu Sans Mono",ui-monospace,monospace}
 .tag{font:700 10px/1 InterV;letter-spacing:.08em;text-transform:uppercase;color:${t.plan};background:${t.planSoft};border:1px dashed ${t.planBorder};padding:4px 7px;border-radius:999px;white-space:nowrap}
+.tag.built{color:${t.ok};background:${t.okSoft};border:1px solid ${t.okBorder}}
 ul.b{list-style:none;margin-top:13px;display:grid;gap:7px}
 ul.b li{position:relative;padding-left:16px;font:400 13.5px/1.3 InterV;color:${t.muted};white-space:nowrap}
 ul.b li::before{content:"";position:absolute;left:2px;top:7px;width:6px;height:6px;border-radius:50%;background:${t.ours}}
@@ -120,7 +121,7 @@ const THIRD = [
   ["audio-waveform", "Deepgram", "api.deepgram.com · nova-2", ["Speech to text for ~4 s clips", "next, save this, repeat", "Called only by the voice poller"]],
 ];
 const PLANNED = [
-  ["link", "Pair the glasses", "g2-app + backend", ["Keep a UUID v4 device id", "Show the /api/pair/start code", "Send ?device= on digest and save"]],
+  ["link", "Pair the glasses", "g2-app + backend", ["UUID v4 kept in Even Hub storage", "Shows the /pair code on the glasses", "Sends ?device= on digest and save"], true],
   ["key-round", "Voice relay secret", "backend + voice poller", ["Secret header from the poller", "On /api/voice-jobs and the audio", "And on /api/voice-result"]],
   ["database-backup", "Atomic state writes", "backend/server.mjs", ["Write a temp file, then rename", "Keep state.json.bak", "Today: written in place"]],
   ["shield-check", "Guard open endpoints", "backend/server.mjs", ["/api/save needs a paired device", "/api/refresh is rate-limited", "Today: both open to anyone"]],
@@ -156,7 +157,9 @@ function architecture(t) {
       <div class="head"><div class="ic third">${icon("cloud", t.third, 20)}</div><div class="tt"><div class="title">Cloudflare</div><div class="sub">proxied DNS</div></div></div>
     </div>`;
   const third = THIRD.map(([ic, ti, su, bl], i) => card("third", `o${i}`, L[i], Y.o, Y.oh, ic, ti, su, bl)).join("");
-  const planned = PLANNED.map(([ic, ti, su, bl], i) => card("plan", `p${i}`, L[i], Y.pl, Y.plh, ic, ti, su, bl, "", `<span class="tag">Planned</span>`)).join("");
+  const planned = PLANNED.map(([ic, ti, su, bl, built], i) => built
+    ? card("ours", `p${i}`, L[i], Y.pl, Y.plh, ic, ti, su, bl, "", `<span class="tag built">Built</span>`)
+    : card("plan", `p${i}`, L[i], Y.pl, Y.plh, ic, ti, su, bl, "", `<span class="tag">Planned</span>`)).join("");
 
   const chipsTop = Y.p3 + Y.plh + 36 + 30 + 24;
   const chips = `<div data-box data-id="chips" style="position:absolute;left:32px;top:${chipsTop}px;width:${W - 64}px;display:flex;justify-content:center;gap:12px">
@@ -194,7 +197,7 @@ function architecture(t) {
     lab("lu0", 30, Y.user + Y.uh + 12, ["Telegram app:", "/digest, /saved, /pair CODE"]),
     lab("lu1", wearX + 12, Y.user + Y.uh + 12, ["ring, tap, voice"]),
     lab("ls0a", g(0), midY - 26, ["HTTPS"], true),
-    lab("ls0b", g(0), midY + 10, ["/api/digest", "/api/save", "/api/voice"], true),
+    lab("ls0b", g(0), midY + 10, ["/api/digest", "/api/save", "/api/voice", "/api/pair"], true),
     lab("ls1a", g(1), midY - 26, ["Tailscale"], true),
     lab("ls1b", g(1), midY + 10, [":8787"], true),
     lab("ls3a", g(2), midY - 26, ["voice jobs"], true),
@@ -212,7 +215,7 @@ function architecture(t) {
   const html = `<!doctype html><html><head><meta charset="utf-8"><style>${css(t, W, H)}</style></head><body>
     ${panel("pt1", Y.p1, Y.sh + 56, "Run by SIERA")}
     ${panel("pt2", Y.p2, Y.oh + 56, "Third-party services")}
-    ${panel("pt3", Y.p3, Y.plh + 56, "Planned hardening · not built yet")}
+    ${panel("pt3", Y.p3, Y.plh + 56, "Hardening · pairing built, three planned")}
     ${svg}${users}${services}${cf}${third}${planned}${labels}${chips}${legend}
   </body></html>`;
   return { W, H, html };
