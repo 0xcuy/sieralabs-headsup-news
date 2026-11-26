@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
 process.env.STATE_DIR = await mkdtemp(join(tmpdir(), 'headsup-test-'))
-const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, savedMessage, splitMessage, server, LANGUAGES, translateDigest, digestMessage } = await import('./server.mjs')
+const { detectBreaking, shouldAlert, rankDigest, createPairing, handleUpdate, refreshWait, isPro, savedMessage, splitMessage, server, LANGUAGES, translateDigest, digestMessage } = await import('./server.mjs')
 
 const now = Date.now()
 const hour = 60 * 60 * 1000
@@ -123,6 +123,7 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
       return Response.json({ choices: [{ message: { content: JSON.stringify(rows) } }] })
     }
     assert.equal(host, 'api.telegram.org')
+    if (url.endsWith('/createInvoiceLink')) return Response.json({ ok: true, result: 'https://t.me/test-invoice-link' })
     sent.push(JSON.parse(options.body))
     if (rejectDelivery) return Response.json({ ok: false, description: 'Bad Request: delivery rejected' }, { status: 400 })
     return Response.json({ ok: true })
@@ -204,12 +205,15 @@ test('refresh, Telegram preferences, pairing, and device digest/save work togeth
   assertPlainDigest(refreshed, 'Ringkasan Berita', 'Diperbarui')
   assert.equal((await api('/api/save', { storyId: personalized.stories[0].id, device })).status, 200)
   await bot(2, '/refresh')
-  assert.match(sent.at(-1).text, /^You can refresh again in (?:4 min \d+ s|5 min)\./)
+  assert.match(sent.at(-1).text, /^You can refresh again in (?:29 min \d+ s|30 min)\. Free plan refreshes every 30 min; \/pro gets 5 min\.$/)
   assert.equal((await digests(device)).updatedAt, refreshed.updatedAt)
   await bot(2, '/saved')
   assert.match(sent.at(-1).text, new RegExp(`^🔖 Saved stories\n\n1\. ${lead.title}\nBBC\n`))
   await bot(2, '/pro')
-  assert.match(sent.at(-1).text, /Free\n- 8-story digest every 30 min[\s\S]*Pro — \$3\/month[\s\S]*Up to 3 paired devices[\s\S]*Payment is not wired up yet \(coming soon\)\./)
+  const proDelivery = sent.at(-1)
+  assert.match(proDelivery.text, /Free\n- 8-story digest every 30 min[\s\S]*Pro — 150 Telegram Stars \/ month[\s\S]*- Up to 3 paired devices[\s\S]*Cancel anytime with \/cancelpro; Pro runs until the paid period ends\.$/)
+  assert.equal(Object.hasOwn(proDelivery, 'parse_mode'), false)
+  assert.deepEqual(proDelivery.reply_markup, { inline_keyboard: [[{ text: 'Upgrade: 150 ⭐/month', url: 'https://t.me/test-invoice-link' }]] })
   await bot(2, '/help')
   for (const command of ['/saved', '/refresh', '/pro', '/unpair']) assert.match(sent.at(-1).text, new RegExp(`^${command} — `, 'm'))
   await bot(2, '/sources')
