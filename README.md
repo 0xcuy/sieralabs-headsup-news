@@ -215,7 +215,7 @@ the English digest with a note and the API flags the fallback.
 `headsup.device` in Even Hub local storage (browser `localStorage` in the
 DOM preview), shows `PAIR GLASSES · send /pair CODE to @HeadsUpNewsBot` in
 the header while the global digest keeps scrolling, polls every 5 s, and
-flashes `✓ PAIRED` when the chat claims the code.
+flashes `PAIRED` when the chat claims the code.
 
 Use HTTPS and keep the device UUID private. Do not expose or include it in
 telemetry. A paired UUID cannot be claimed by another chat until it is

@@ -9,7 +9,7 @@
 //
 // Pairing: the app makes a random device id once and keeps it in the
 // Even Hub local storage. Until a Telegram chat claims it, the header shows
-// a four-digit code for "/pair CODE" in @HeadsUpNewsBot; once paired, the
+// a six-digit code for "/pair CODE" in @HeadsUpNewsBot; once paired, the
 // digest is that chat's personal digest and saves go only to that chat.
 //
 // SDK rule (README): exactly ONE container may have isEventCapture=1 —
@@ -450,7 +450,7 @@ async function setPaired(next: boolean, reload = false) {
   if (next) {
     pairCode = ''
     pairExpiresAt = 0
-    if (was === false) flash('✓ PAIRED — showing your Telegram digest')
+    if (was === false) flash('PAIRED — showing your Telegram digest')
   } else if (!pairCode || Date.now() >= pairExpiresAt) {
     await requestPairCode()
   }
