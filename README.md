@@ -41,7 +41,7 @@ headlines with source links, without copying descriptions into summaries.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
-  <img alt="Heads Up News architecture. Users: a Telegram user in their own chat with the bot, and a G2 glasses wearer using ring + tap, voice and save to Telegram. Run by SIERA: the G2 app (g2-app/src/main.ts, on the glasses, Even Hub SDK) calls headsup.sieralabs.com over HTTPS for /api/digest, /api/save, /api/voice and /api/pair, through Cloudflare (proxied DNS) to Traefik; Traefik on the SIERA VPS terminates TLS and routes over Tailscale to port 8787 on the 32GB droplet; the Telegram bot backend (backend/server.mjs, Node 22 or later, zero npm dependencies, state in state.json) runs there; the voice poller (voice-poller/deepgram_poller.py) also runs on the 32GB droplet, reads the Deepgram key from a mode-600 file, polls the backend directly on port 8787 for voice jobs and posts transcripts back. Third-party services: the Telegram Bot API (getUpdates long polling, sendMessage as plain text), which Telegram users reach with /digest, /saved and /pair CODE; the RSS feeds of BBC World, The Guardian World, Al Jazeera and The Verge, read every 30 minutes; the 0G Compute router with glm-5.3-flash for the digest and translation into 10 languages via /lang; and Deepgram nova-2 speech to text, called only by the voice poller. Hardening: pairing the glasses is built (a UUID v4 device id kept in Even Hub storage, the /pair code shown on the glasses, ?device= on digest and save). Planned, not built yet: a shared secret for the voice relay, atomic state writes with state.json.bak, and a paired device for /api/save plus a rate limit on /api/refresh." src="docs/architecture-light.png">
+  <img alt="Heads Up News architecture. Users: a Telegram user in their own chat with the bot, and a G2 glasses wearer using ring + tap, voice and save to Telegram. Run by SIERA: the G2 app (g2-app/src/main.ts, on the glasses, Even Hub SDK) calls headsup.sieralabs.com over HTTPS for /api/digest, /api/save, /api/voice and /api/pair, through Cloudflare (proxied DNS) to Traefik; Traefik on the SIERA VPS terminates TLS and routes over Tailscale to port 8787 on the 32GB droplet; the Telegram bot backend (backend/server.mjs, Node 22 or later, zero npm dependencies, state in state.json) runs there; the voice poller (voice-poller/deepgram_poller.py) also runs on the 32GB droplet, reads the Deepgram key from a mode-600 file, polls the backend directly on port 8787 for voice jobs and posts transcripts back. Third-party services: the Telegram Bot API (getUpdates long polling, sendMessage as plain text), which Telegram users reach with /digest, /saved and /pair CODE; the RSS feeds of BBC World, The Guardian World, Al Jazeera and The Verge, read every 30 minutes; the 0G Compute router with glm-5.3-flash for the digest and translation into 10 languages via /lang; and Deepgram nova-2 speech to text, called only by the voice poller. Hardening: pairing the glasses is built (a UUID v4 device id kept in Even Hub storage, the /pair code shown on the glasses, ?device= on digest and save), plus Stars payments for the Pro subscription (150 Stars / 30 days; atomic state.json writes with a state.json.bak backup). Planned, not built yet: a shared secret for the voice relay, and a rate limit on /api/refresh." src="docs/architecture-light.png">
 </picture>
 
 The diagram shows what runs today; in the bottom band the green "Built"
@@ -65,19 +65,25 @@ stays dependency-free.
 | `/start` | Link this chat |
 | `/digest` | Show your latest digest |
 | `/saved` | List the stories this chat saved from the glasses, newest first (last 10) |
-| `/refresh` | Fetch a fresh digest now and send it (once every 5 minutes per chat on Free) |
-| `/pro` | Show the Free and Pro plans |
+| `/refresh` | Fetch a fresh digest now and send it (every 30 minutes on Free, every 5 minutes on Pro) |
+| `/pro` | Show the Free and Pro plans with an "Upgrade: 150 ⭐/month" button |
+| `/cancelpro` | Stop Pro auto-renewal; Pro stays on until the paid period ends |
+| `/terms` | Pro subscription terms (price, auto-renewal, cancellation, refunds) |
+| `/paysupport` | How to get payment support and refunds |
 | `/alerts on\|off` | Toggle breaking-news alerts |
-| `/topics` | Set priority categories (or `all`) |
+| `/topics` | Set priority categories (or `all`); max 3 on Free, unlimited on Pro |
 | `/lang CODE` | Set digest language: `en`, `id`, `ru`, `zh`, `es`, `fr`, `de`, `ja`, `ar` or `pt` (see [Languages](#languages)) |
 | `/place world\|Indonesia` | Set geographic priority |
-| `/pair CODE` | Link your glasses in a private chat |
+| `/pair CODE` | Link your glasses in a private chat (1 pair on Free, up to 3 on Pro) |
 | `/unpair` | Unlink this chat's glasses; they show a new pairing code |
+| `/refund` | Owner only: refund a Pro payment and revoke Pro |
 | `/sources` | List news feeds |
 | `/help` | List all commands |
 
 Every bot message is sent as plain text (no `parse_mode`), because the
-AI-written digest can contain stray Markdown characters.
+AI-written digest can contain stray Markdown characters. The `/pro` upgrade
+control is an inline URL button that opens a Telegram payment sheet — Stars
+payments run entirely inside Telegram, with no external payment provider.
 
 ## Languages
 
@@ -103,18 +109,65 @@ digest itself stay in English.
 
 ## Plans
 
-| | Free | Pro — $3/month |
+Paid via **Telegram Stars** — the only way to sell digital goods inside a
+Telegram bot (app-store rules and Telegram terms; no Stripe or any other
+payment provider, no crypto). 150 Stars every 30 days (buyer pays ~$2.99,
+owner receives ~$1.95 after Telegram's cut), set up as a Telegram bot
+subscription with auto-renewal. No provider signup, no KYC, and no new keys:
+it uses the existing bot token.
+
+| | Free | Pro — 150 Stars / 30 days |
 | --- | --- | --- |
-| Digest | 8-story digest every 30 min | Same, plus `/refresh` anytime (no cooldown) |
+| Digest | 8-story digest every 30 min | Same, plus `/refresh` every 5 min (Free: every 30 min) |
 | Breaking alerts | Yes | Yes |
-| Saved stories | Yes | Unlimited |
-| Topics | Yes | Unlimited |
-| Paired glasses | 1 | Up to 3 devices |
+| Saved stories | 20 | Unlimited |
+| Topics | 3 priority topics | Unlimited |
+| Paired glasses | 1 device | Up to 3 devices |
 | Languages | 10 digest languages | 10 digest languages |
 | New features | — | Early access |
 
-Payment is not wired up yet (coming soon). `/pro` shows these plans in
-Telegram.
+`/pro` sends the plan overview with an "Upgrade: 150 ⭐/month" button that
+opens a Stars subscription checkout generated by `createInvoiceLink` (30
+days is the only subscription period Telegram allows). The bot answers the
+pre-checkout query within Telegram's 10-second limit and stores the Pro
+expiry (`proUntil`, plus the Telegram charge id) in `state.json` on the
+successful-payment confirmation. Telegram re-charges every 30 days and each
+renewal pushes `proUntil` forward; if the user cancels or a charge fails, Pro
+simply turns off at the expiry date — no scheduled job needed.
+
+- `/cancelpro` stops the auto-renewal (`editUserStarSubscription`);
+  Pro stays on until the paid period ends.
+- `/terms` and `/paysupport` are the payment texts Telegram requires before
+  a payments bot goes live.
+- `/refund <chat id>` is owner-only (`ADMIN_CHAT_ID` env) and refunds the
+  last charge via `refundStarPayment`, revoking Pro immediately.
+
+### Testing the Stars flow without spending money
+
+Telegram maintains a separate test environment where Stars payments are free.
+Run the backend against it:
+
+1. Build/run a local Bot API server (`telegram-bot-api`) with `--test-dc`,
+   which connects to Telegram's test data center.
+2. In the test environment (web.telegram.org/?test=1 or a test-build client),
+   create a throwaway account and a test bot with @BotFather; save its token
+   to a file (for example `/root/headsup/test-bot-token`), never in the repo.
+3. Start the backend pointed at the local server and the test token:
+
+   ```bash
+   TELEGRAM_API=http://127.0.0.1:8081 \
+   BOT_TOKEN_FILE=/root/headsup/test-bot-token \
+   ADMIN_CHAT_ID=<your telegram id> \
+   STATE_DIR=/root/headsup-test \
+   node backend/server.mjs
+   ```
+
+4. Message the test bot, press `/pro`, tap the upgrade button, and pay with
+   test Stars. `/terms` and `/paysupport` must be set for the bot before
+   switching to production (Telegram's live checklist).
+
+The unit tests (`node --test`) cover the same flow end to end with a mocked
+Bot API and no token present.
 
 ## Feedback
 
@@ -164,8 +217,10 @@ chmod 600 /root/headsup/telegram-bot-token
 echo '<0G_ROUTER_API_KEY>' > /root/.config/0g-router/api-key
 chmod 600 /root/.config/0g-router/api-key
 # 3. Run:
-node backend/server.mjs          # listens on :8787
+ADMIN_CHAT_ID=<your Telegram user id> node backend/server.mjs   # listens on :8787
 ```
+
+`ADMIN_CHAT_ID` (optional) enables the owner-only `/refund` command.
 
 Endpoints: `GET /health`, `GET /api/digest?device=`, `POST /api/save {storyId, device?}`,
 `POST /api/pair/start {device}`, `GET /api/pair/status?device=`,

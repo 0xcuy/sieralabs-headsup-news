@@ -4,7 +4,7 @@
 // Runs on the 32GB droplet. No npm dependencies; Node >= 22 built-ins only.
 // Secrets (bot token, 0G key) are read from files on disk, never logged.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, copyFileSync, renameSync, existsSync, mkdirSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { randomUUID, randomInt, createHash } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
@@ -13,6 +13,13 @@ const PORT = Number(process.env.PORT || 8787)
 const STATE_DIR = process.env.STATE_DIR || '/root/headsup'
 const STATE_FILE = `${STATE_DIR}/state.json`
 const BOT_TOKEN_FILE = process.env.BOT_TOKEN_FILE || '/root/headsup/telegram-bot-token'
+// Bot API base URL override: pointing this at a local test-server build of
+// telegram-bot-api (started with --test-dc) puts the bot in Telegram's $0 test
+// environment, where Stars payments don't cost real money. The token still
+// comes only from BOT_TOKEN_FILE.
+const TELEGRAM_API = process.env.TELEGRAM_API || 'https://api.telegram.org'
+// Telegram user id allowed to run /refund (bot owner). No secret: a user id.
+const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID || 0)
 const OG_KEY_FILE = '/root/.config/0g-router/api-key'
 const OG_API_URL = 'https://router-api.0g.ai/v1/chat/completions'
 const OG_MODEL = 'glm-5.3-flash'
@@ -51,6 +58,20 @@ export const LANGUAGES = {
   pt: { name: 'Portuguese', native: 'Português', title: 'Resumo de notícias', updated: 'Atualizado', locale: 'pt-BR' },
 }
 const LANGUAGE_LIST = Object.entries(LANGUAGES).map(([code, l]) => `${code} ${l.name}`).join(', ')
+// Telegram Stars subscription (Bot API): XTR, exactly one LabeledPrice,
+// 2592000 s (30 days) is the only allowed subscription_period.
+const PRO_PRICE_STARS = 150
+const PRO_PAYLOAD = 'headsup-pro-subscription'
+const PRO_PERIOD_SECONDS = 2592000
+const PRO_PERIOD_MS = PRO_PERIOD_SECONDS * 1000
+const PRO_INVOICE_TITLE = 'Heads Up News Pro'
+const PRO_INVOICE_DESCRIPTION = 'Unlimited saves and topics, /refresh every 5 min, up to 3 paired glasses. Renews every 30 days; cancel anytime with /cancelpro.'
+// Free-tier limits (Pro lifts them).
+const FREE_MAX_SAVED = 20
+const FREE_MAX_TOPICS = 3
+const FREE_REFRESH_COOLDOWN_MS = 30 * 60 * 1000
+const FREE_MAX_DEVICES = 1
+const PRO_MAX_DEVICES = 3
 const HELP = [
   '/start — link this chat',
   '/digest — show your latest digest',
@@ -62,7 +83,10 @@ const HELP = [
   '/unpair — unlink the glasses paired to this chat',
   '/saved — list stories you saved from your glasses',
   '/refresh — fetch a fresh digest now',
-  '/pro — see Free and Pro plans',
+  '/pro — see Free and Pro plans, upgrade',
+  '/cancelpro — stop Pro auto-renewal',
+  '/terms — Pro subscription terms',
+  '/paysupport — payment support',
   '/sources — list news feeds',
 ].join('\n')
 const PRO = [
@@ -71,17 +95,40 @@ const PRO = [
   'Free',
   '- 8-story digest every 30 min',
   '- Breaking alerts',
+  '- 20 saved stories',
+  '- 3 priority topics',
+  '- /refresh every 30 min',
   '- 1 paired glasses',
   `- ${Object.keys(LANGUAGES).length} digest languages (/lang)`,
   '',
-  'Pro — $3/month',
+  `Pro — ${PRO_PRICE_STARS} Telegram Stars / month`,
   '- Unlimited saved stories',
-  '- /refresh anytime (no cooldown)',
-  '- Unlimited topics',
+  '- Unlimited priority topics',
+  '- /refresh every 5 min',
   '- Up to 3 paired devices',
+  `- All ${Object.keys(LANGUAGES).length} digest languages`,
   '- Early access to new features',
   '',
-  'Payment is not wired up yet (coming soon).',
+  'Billed in Telegram Stars. Renews automatically every 30 days.',
+  'Cancel anytime with /cancelpro; Pro runs until the paid period ends.',
+].join('\n')
+const TERMS = [
+  'Heads Up News Pro — Terms',
+  '',
+  'Pro is a subscription inside the @HeadsUpNewsBot Telegram bot: unlimited saved stories, unlimited priority topics, /refresh every 5 minutes instead of 30, and up to 3 paired glasses instead of 1.',
+  '',
+  `Price: ${PRO_PRICE_STARS} Telegram Stars every 30 days, charged automatically by Telegram until you cancel.`,
+  'The Free tier includes 20 saved stories, 3 priority topics, /refresh every 30 minutes and 1 paired glasses.',
+  'Cancellation: /cancelpro stops renewal; Pro stays on until the paid period ends. You can also cancel from the payment receipt in this chat.',
+  'Refunds: issued by the bot owner at your request, within reason, via /paysupport.',
+  'Heads Up News is an experimental news digest; delivery is provided as is, without warranty.',
+].join('\n')
+const PAYSUPPORT = [
+  'Payment support',
+  '',
+  `For charges, cancellations or refunds of Heads Up News Pro (${PRO_PRICE_STARS} Stars / 30 days), reply in this chat and the bot owner will get back to you. You can also open an issue at github.com/0xcuy/sieralabs-headsup-news/issues.`,
+  'Note: Telegram support cannot help with purchases made via this bot - the bot owner handles all payment support.',
+  'To cancel renewal yourself, use /cancelpro here or the payment receipt in this chat.',
 ].join('\n')
 
 const MAX_STORIES = 8
@@ -97,14 +144,25 @@ const MAX_SAVED_LIST = 10
 const MANUAL_REFRESH_COOLDOWN_MS = 5 * 60 * 1000
 const DEVICE_ID = /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i
 
-let state = { digest: null, updatedAt: null, chats: [], saved: [], preferences: {}, devices: {}, alerts: [] }
+let state = { digest: null, updatedAt: null, chats: [], saved: [], preferences: {}, devices: {}, alerts: [], pro: {} }
+// Atomic: never truncate state.json in place. Back up the current file to
+// .bak, write the new state to a temp file, then rename over the target.
+// A crash mid-write leaves either the old or the new file, never a truncated
+// one — required before storing payment data (proUntil, charge ids).
 function persist() {
-  try { writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)) } catch (e) { console.error('[state] write failed', e.message) }
+  try {
+    const tmp = `${STATE_FILE}.tmp`
+    if (existsSync(STATE_FILE)) {
+      try { copyFileSync(STATE_FILE, `${STATE_FILE}.bak`) } catch (e) { console.error('[state] backup failed', e.message) }
+    }
+    writeFileSync(tmp, JSON.stringify(state, null, 2))
+    renameSync(tmp, STATE_FILE)
+  } catch (e) { console.error('[state] write failed', e.message) }
 }
 
 let botToken, ogKey
 const tg = (method, body) =>
-  fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+  fetch(`${TELEGRAM_API}/bot${botToken}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -363,8 +421,25 @@ export function createPairing(now = Date.now, nextCode = () => String(randomInt(
 const pairing = createPairing()
 const manualRefreshAt = new Map()
 
-export function refreshWait(lastAt, now = Date.now()) {
-  const left = lastAt === undefined ? 0 : lastAt + MANUAL_REFRESH_COOLDOWN_MS - now
+// Pro status comes straight from state.pro[chatId] = { proUntil, chargeId, cancelRequested }: proUntil
+// is only set by a confirmed Telegram Stars payment and never extended by a
+// cron — when renewal stops, the date passes and the user is Free again.
+export function isPro(entry, now = Date.now()) {
+  return Boolean(entry?.proUntil && Date.parse(entry.proUntil) > now)
+}
+function proDate(iso) {
+  return new Date(iso).toLocaleDateString('en-GB', { timeZone: 'Asia/Jakarta', day: 'numeric', month: 'long', year: 'numeric' })
+}
+// Saves counted toward the Free limit follow the same ownership rules as
+// savedMessage: entries record their chats, pre-attribution entries belong to
+// the single linked chat of the time.
+function savedCountFor(saved, chatId, linkedChats) {
+  const legacyOwner = linkedChats.length === 1 && linkedChats[0] === chatId
+  return saved.filter(entry => entry.chats ? entry.chats.includes(chatId) : legacyOwner).length
+}
+
+export function refreshWait(lastAt, now = Date.now(), cooldown = MANUAL_REFRESH_COOLDOWN_MS) {
+  const left = lastAt === undefined ? 0 : lastAt + cooldown - now
   if (left <= 0) return null
   const seconds = Math.ceil(left / 1000), min = Math.floor(seconds / 60), sec = seconds % 60
   return [min && `${min} min`, sec && `${sec} s`].filter(Boolean).join(' ')
@@ -405,10 +480,13 @@ export function splitMessage(text, limit = 4096) {
   if (current) parts.push(current)
   return parts
 }
-async function sendToChat(chatId, text) {
-  for (const part of splitMessage(text)) {
+async function sendToChat(chatId, text, extra) {
+  const parts = splitMessage(text)
+  for (const [i, part] of parts.entries()) {
     try {
-      const r = await tg('sendMessage', { chat_id: chatId, text: part, disable_web_page_preview: true })
+      // extra (an inline keyboard for /pro) rides on the first part only;
+      // text is always plain — parse_mode is never set.
+      const r = await tg('sendMessage', { chat_id: chatId, text: part, disable_web_page_preview: true, ...(i === 0 && extra ? extra : {}) })
       if (!r.ok) return console.error('[tg] send failed', chatId, r.description)
     } catch (e) { return console.error('[tg] send error', chatId, e.message) }
   }
@@ -417,15 +495,52 @@ async function sendToChat(chatId, text) {
 async function sendToChats(text, chats = state.chats) {
   for (const chatId of chats) await sendToChat(chatId, text)
 }
+// ---------- Telegram Stars (Pro subscription) ----------
+// Digital goods sold inside a Telegram bot must be paid in Telegram Stars
+// (Bot API currency "XTR"); crypto and third-party providers are not allowed.
+// No provider token is involved and 30 days is the only subscription period
+// Telegram permits. See /pro for the invoice and the commands below for the
+// subscription lifecycle. Details verified against core.telegram.org/bots/api.
+
+async function answerPreCheckout(query) {
+  // Telegram cancels the purchase if the answer does not arrive within 10 s,
+  // so this answers immediately — nothing is awaited before the call.
+  const ok = query.currency === 'XTR' && query.total_amount === PRO_PRICE_STARS && query.invoice_payload === PRO_PAYLOAD
+  const body = ok
+    ? { pre_checkout_query_id: query.id, ok: true }
+    : { pre_checkout_query_id: query.id, ok: false, error_message: 'This invoice is no longer available. Send /pro for a fresh upgrade link.' }
+  try { await tg('answerPreCheckoutQuery', body) } catch (e) { console.error('[tg] answerPreCheckoutQuery failed', e.message) }
+}
+
+async function handleSuccessfulPayment(msg) {
+  const payment = msg.successful_payment
+  if (payment.invoice_payload !== PRO_PAYLOAD) return
+  const chatId = msg.chat.id
+  const current = state.pro?.[chatId]
+  // Telegram re-charges every 30 days; each renewal pushes the expiry forward.
+  // subscription_expiration_date is authoritative when present.
+  const base = current?.proUntil ? Math.max(Date.now(), Date.parse(current.proUntil)) : Date.now()
+  const untilMs = payment.subscription_expiration_date ? payment.subscription_expiration_date * 1000 : base + PRO_PERIOD_MS
+  state.pro[chatId] = { proUntil: new Date(untilMs).toISOString(), chargeId: payment.telegram_payment_charge_id, cancelRequested: false }
+  if (!state.chats.includes(chatId)) state.chats.push(chatId)
+  persist()
+  const entry = state.pro[chatId]
+  await sendToChat(chatId, `Pro active until ${proDate(entry.proUntil)}.\nRenews automatically every 30 days; /cancelpro stops renewal.`)
+  console.log(`[stars] chat ${chatId} paid ${payment.total_amount} XTR; Pro until ${entry.proUntil}`)
+}
+
 export async function handleUpdate(u) {
+  if (u.pre_checkout_query) return answerPreCheckout(u.pre_checkout_query)
   const msg = u.message
+  if (msg?.successful_payment) return handleSuccessfulPayment(msg)
   if (!msg || !msg.text) return
   const chatId = msg.chat.id
   const [target, ...args] = msg.text.trim().split(/\s+/)
   const [command, username] = target.toLowerCase().split('@')
   if (username && username !== 'headsupnewsbot') return
-  const reply = text => sendToChat(chatId, text)
+  const reply = (text, extra) => sendToChat(chatId, text, extra)
   const value = args.join(' ').toLowerCase()
+  const pro = isPro(state.pro?.[chatId])
   function setPreference(key, value) {
     state.preferences[chatId] = { ...state.preferences[chatId], [key]: value }
     persist()
@@ -442,7 +557,10 @@ export async function handleUpdate(u) {
   } else if (command === '/topics') {
     const topics = [...new Set(value.toUpperCase().split(/[\s,]+/).filter(Boolean))]
     if (value === 'all') setPreference('topics', [])
-    else if (topics.length && topics.every(topic => CATEGORIES.includes(topic))) setPreference('topics', topics)
+    else if (topics.length && topics.every(topic => CATEGORIES.includes(topic))) {
+      if (!pro && topics.length > FREE_MAX_TOPICS) return reply(`Free allows up to ${FREE_MAX_TOPICS} priority topics. Pro lifts the limit; see /pro.`)
+      setPreference('topics', topics)
+    }
     await reply(`Priority topics: ${(state.preferences[chatId]?.topics || []).join(', ') || 'all'}. Use /topics followed by any of: ${CATEGORIES.join(', ')}. Use /topics all to reset.`)
   } else if (command === '/lang') {
     if (value && !Object.hasOwn(LANGUAGES, value)) return reply(`Unknown language "${value}". Supported: ${LANGUAGE_LIST}.`)
@@ -455,6 +573,9 @@ export async function handleUpdate(u) {
   } else if (command === '/pair') {
     if (msg.chat.type !== 'private') return reply('Send /pair and the code in a private chat with @HeadsUpNewsBot.')
     if (!/^\d{6}$/.test(value)) return reply('Use /pair followed by the six-digit code on your glasses.')
+    const pairedCount = Object.values(state.devices).filter(owner => owner === chatId).length
+    const maxDevices = pro ? PRO_MAX_DEVICES : FREE_MAX_DEVICES
+    if (pairedCount >= maxDevices) return reply(`Your plan allows ${maxDevices === 1 ? '1 paired glasses' : `up to ${maxDevices} paired glasses`}. ${pro ? 'Unpair one first with /unpair.' : 'See /pro to pair up to 3.'}`)
     const { device, error } = pairing.claim(value, chatId)
     if (error === 'too_many_attempts') return reply('Too many pairing attempts. Wait a few minutes and request a new code.')
     if (!device) return reply('That code is invalid or expired. Request a code on your glasses.')
@@ -471,8 +592,8 @@ export async function handleUpdate(u) {
   } else if (command === '/saved') {
     await reply(savedMessage(state.saved, state.digest, chatId, state.chats))
   } else if (command === '/refresh') {
-    const wait = refreshWait(manualRefreshAt.get(chatId))
-    if (wait) return reply(`You can refresh again in ${wait}. The digest also refreshes every 30 min.`)
+    const wait = refreshWait(manualRefreshAt.get(chatId), Date.now(), pro ? MANUAL_REFRESH_COOLDOWN_MS : FREE_REFRESH_COOLDOWN_MS)
+    if (wait) return reply(`You can refresh again in ${wait}. ${pro ? 'The digest also refreshes every 30 min.' : 'Free plan refreshes every 30 min; /pro gets 5 min.'}`)
     manualRefreshAt.set(chatId, Date.now())
     await reply('Refreshing now. Your new digest will follow in a moment.')
     // Detached so a slow refresh does not hold up other chats' commands in pollLoop.
@@ -482,7 +603,50 @@ export async function handleUpdate(u) {
     }).catch(e => console.error('[tg] /refresh failed', chatId, e.message))
 
   } else if (command === '/pro') {
-    await reply(PRO)
+    // A Stars subscription can only be sold via a Telegram-generated link
+    // (30 days is the only period); createInvoiceLink makes it the button URL.
+    let link = null
+    try {
+      const r = await tg('createInvoiceLink', {
+        title: PRO_INVOICE_TITLE,
+        description: PRO_INVOICE_DESCRIPTION,
+        payload: PRO_PAYLOAD,
+        provider_token: '',
+        currency: 'XTR',
+        prices: [{ label: PRO_INVOICE_TITLE, amount: PRO_PRICE_STARS }],
+        subscription_period: PRO_PERIOD_SECONDS,
+      })
+      if (r.ok && typeof r.result === 'string') link = r.result
+      else console.error('[stars] createInvoiceLink failed', r.description)
+    } catch (e) { console.error('[stars] createInvoiceLink error', e.message) }
+    const headline = pro ? 'You are on Pro. Thank you!' : null
+    if (link) await reply(`${headline ? `${headline}\n\n` : ''}${PRO}`, { reply_markup: { inline_keyboard: [[{ text: 'Upgrade: 150 ⭐/month', url: link }]] } })
+    else await reply(`${PRO}\n\nPayments are momentarily unavailable; try again in a minute.`)
+  } else if (command === '/cancelpro') {
+    const entry = state.pro?.[chatId]
+    if (!pro) return reply('You do not have an active Pro subscription.')
+    if (entry.cancelRequested) return reply(`Renewal is already stopped. Pro stays on until ${proDate(entry.proUntil)}.`)
+    // editUserStarSubscription(is_canceled: true) stops auto-renewal while the
+    // subscription stays active to the end of the paid period.
+    const r = await tg('editUserStarSubscription', { user_id: chatId, telegram_payment_charge_id: entry.chargeId, is_canceled: true })
+    if (!r.ok) return reply('Could not cancel renewal right now. Try again in a minute, or cancel from the payment receipt in this chat.')
+    entry.cancelRequested = true
+    persist()
+    await reply(`Renewal cancelled. Pro stays on until ${proDate(entry.proUntil)}. Cancelled by mistake? Payments resume if you subscribe again.`)
+  } else if (command === '/terms') {
+    await reply(TERMS)
+  } else if (command === '/paysupport') {
+    await reply(PAYSUPPORT)
+  } else if (command === '/refund') {
+    if (chatId !== ADMIN_CHAT_ID) return reply('Only the bot owner can issue refunds.')
+    const target = Number(args[0])
+    const entry = Number.isInteger(target) && target > 0 ? state.pro?.[target] : null
+    if (!entry?.chargeId) return reply('Usage: /refund <chat id> of a chat with an active Pro payment.')
+    const r = await tg('refundStarPayment', { user_id: target, telegram_payment_charge_id: entry.chargeId })
+    if (!r.ok) return reply(`Refund failed: ${r.description || 'unknown error'}`)
+    delete state.pro[target]
+    persist()
+    await reply(`Refunded ${PRO_PRICE_STARS} Stars (charge ${entry.chargeId}) and revoked Pro for chat ${target}.`)
   } else if (command === '/sources') {
     await reply(`Sources (public RSS feeds):\n${FEEDS.map(feed => `${feed.source}: ${feed.url}`).join('\n')}\n\nHeads Up News rewrites short summaries and links to the original articles. It does not fetch full article bodies.`)
   } else if (command === '/help') {
@@ -493,7 +657,7 @@ async function pollLoop() {
   let offset = 0
   for (;;) {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${botToken}/getUpdates?offset=${offset}&timeout=25`, { signal: AbortSignal.timeout(40000) })
+      const res = await fetch(`${TELEGRAM_API}/bot${botToken}/getUpdates?offset=${offset}&timeout=25`, { signal: AbortSignal.timeout(40000) })
       const data = await res.json()
       if (data.ok) {
         for (const u of data.result) { offset = u.update_id + 1; await handleUpdate(u) }
@@ -608,6 +772,10 @@ export const server = createServer(async (req, res) => {
         if (device !== undefined && chatId === undefined) return jsonResponse(res, 409, { ok: false, error: 'device_not_paired' })
         if (state.chats.length === 0) { res.writeHead(409, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'no_chat_linked', hint: 'Open @HeadsUpNewsBot and press /start first.' })) }
         const chats = chatId === undefined ? [...state.chats] : [chatId]
+        if (chatId !== undefined && !isPro(state.pro?.[chatId]) && savedCountFor(state.saved, chatId, state.chats) >= FREE_MAX_SAVED) {
+          await sendToChat(chatId, `Free plan: ${FREE_MAX_SAVED} saved stories limit reached. Your save was not kept. /pro lifts the limit.`)
+          return jsonResponse(res, 402, { ok: false, error: 'free_limit', limit: 'saved_stories', hint: `Free plan allows ${FREE_MAX_SAVED} saved stories; /pro in @HeadsUpNewsBot lifts all limits.` })
+        }
         state.saved.push({ storyId, at: new Date().toISOString(), chats, headline: story.headline, source: story.source, url: story.url }); persist()
         await sendToChats([`🔖 Saved from your G2 glasses\n\n${story.headline}`, story.summary, story.source, story.url].filter(Boolean).join('\n'), chats)
         res.writeHead(200, { 'content-type': 'application/json' })
@@ -714,6 +882,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   mkdirSync(STATE_DIR, { recursive: true })
   if (existsSync(STATE_FILE)) {
     try { state = { ...state, ...JSON.parse(readFileSync(STATE_FILE, 'utf8')) } } catch { /* corrupt state: start fresh */ }
+    state.pro ??= {}
   }
   botToken = readFileSync(BOT_TOKEN_FILE, 'utf8').trim()
   ogKey = readFileSync(OG_KEY_FILE, 'utf8').trim()
