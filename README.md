@@ -1,4 +1,4 @@
-![Heads Up News — Telegram AI news digest for Even Realities G2 glasses](banner.png)
+![Heads Up News — Telegram AI news digest for Even Realities G2 glasses](banner.jpg)
 
 # Heads Up News — Telegram AI news digest for Even Realities G2
 
