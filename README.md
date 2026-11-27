@@ -71,7 +71,7 @@ stays dependency-free.
 | `/terms` | Pro subscription terms (price, auto-renewal, cancellation, refunds) |
 | `/paysupport` | How to get payment support and refunds |
 | `/alerts on\|off` | Toggle breaking-news alerts |
-| `/topics` | Set priority categories (or `all`); max 3 on Free, unlimited on Pro |
+| `/topics` | Set priority categories (or `all`); max 3 on Free, unlimited on Pro. Breaking alerts also follow these topics |
 | `/lang CODE` | Set digest language: `en`, `id`, `ru`, `zh`, `es`, `fr`, `de`, `ja`, `ar` or `pt` (see [Languages](#languages)) |
 | `/place world\|Indonesia` | Set geographic priority |
 | `/pair CODE` | Link your glasses in a private chat (1 pair on Free, up to 3 on Pro) |
@@ -106,6 +106,25 @@ English and translated by GLM on the 0G router; the header and the
 
 Any other code gets a reply listing these ten. Bot replies other than the
 digest itself stay in English.
+
+## Breaking news
+
+Breaking stories surface in two places:
+
+- **Telegram alerts, every 2 minutes.** A lightweight loop fetches the
+  RSS sources and runs only breaking detection — an editorial
+  Breaking/Urgent headline, or the same story in 2+ distinct sources
+  within a 2-hour window — and sends a `🚨 Breaking news` alert. Alerts
+  follow `/topics`: a chat only gets the alert when the story's category
+  matches its chosen topics, and an empty topic list means all topics.
+  A 1-hour cooldown plus a 48-hour dedup keep any story from alerting
+  twice, and `/alerts off` silences a chat. The fast loop never calls
+  GLM and never rebuilds the digest.
+- **The lens.** The 30-minute GLM digest flags the breaking lead
+  (`breaking: true`); the G2 app shows it as `🚨 BREAKING —` before the
+  headline (on glass and in the DOM fallback) and flashes
+  `🚨 BREAKING NEWS` once per new breaking story, tracked by story URL
+  so later polls do not re-flash it.
 
 ## Plans
 
