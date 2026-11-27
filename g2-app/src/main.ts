@@ -24,6 +24,7 @@ import {
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
+import { BREAKING_FLASH, markedHeadline } from './breaking'
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) || 'https://headsup.sieralabs.com'
 const HEADER_ID = 1
@@ -55,6 +56,7 @@ type Story = {
   source: string
   url: string
   published: string
+  breaking?: boolean
 }
 
 let stories: Story[] = []
@@ -101,7 +103,7 @@ function headerText(): string {
 function storyText(): string {
   if (stories.length === 0) return 'Fetching today\'s digest…\nGlanceable news, one story at a time.'
   const s = stories[index]
-  return `${index + 1}/${stories.length} · ${s.category} — ${s.source}\n${s.headline}\n${s.summary}`
+  return `${index + 1}/${stories.length} · ${s.category} — ${s.source}\n${markedHeadline(s)}\n${s.summary}`
 }
 
 async function pushToGlasses() {
@@ -122,7 +124,7 @@ function renderDomFallback() {
       <div style="opacity:.7;font-size:13px">${headerText()}</div>
       ${paired === false && pairCode ? `<div style="margin:10px 0;padding:8px;border:1px solid #4ade9f;border-radius:6px">Pair these glasses: send <b>/pair ${pairCode}</b> to @HeadsUpNewsBot in a private chat.</div>` : ''}
       <h2 style="margin:12px 0 6px">${index + 1}/${stories.length} · ${s.category} — ${s.source}</h2>
-      <div style="font-size:20px;font-weight:700">${s.headline}</div>
+      <div style="font-size:20px;font-weight:700">${markedHeadline(s)}</div>
       <p style="font-size:15px">${s.summary}</p>
       <button id="nextBtn">Next story →</button>
       <button id="saveBtn">★ Save to Telegram</button>
@@ -174,6 +176,17 @@ function flash(msg: string) {
   saveFlash = msg
   void refresh()
   window.setTimeout(() => { saveFlash = ''; void refresh() }, 4000)
+}
+
+// Breaking badge: flash once when a poll surfaces a breaking story this
+// lens has not shown before; the seen-set keeps the 5-minute polls from
+// re-flashing the same story.
+const seenBreakingUrls = new Set<string>()
+
+function noteBreakingFlash() {
+  if (!stories.some(s => s.breaking && !seenBreakingUrls.has(s.url))) return
+  for (const s of stories) if (s.breaking) seenBreakingUrls.add(s.url)
+  flash(BREAKING_FLASH)
 }
 
 function nextStory() {
@@ -469,6 +482,7 @@ async function loadDigest() {
       stories = data.stories
       updatedAt = data.updatedAt || ''
       if (index >= stories.length) index = 0
+      noteBreakingFlash()
     }
     if (device && typeof data.paired === 'boolean' && data.paired !== paired) await setPaired(data.paired)
   } catch (e) {

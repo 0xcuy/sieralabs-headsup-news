@@ -133,6 +133,7 @@ const PAYSUPPORT = [
 
 const MAX_STORIES = 8
 const REFRESH_MS = 30 * 60 * 1000
+const FAST_REFRESH_MS = 2 * 60 * 1000
 const ALERT_COOLDOWN_MS = 60 * 60 * 1000
 const BREAKING_MAX_AGE_MS = 2 * ALERT_COOLDOWN_MS
 const ALERT_HISTORY_MS = 2 * 24 * ALERT_COOLDOWN_MS
@@ -259,6 +260,24 @@ export function shouldAlert(candidate, history, now = Date.now()) {
   return !history.some(alert => now - alert.at < ALERT_COOLDOWN_MS ||
     (now - alert.at < ALERT_HISTORY_MS && (alert.url === candidate.url || sameStory(alert, candidate))))
 }
+// Raw RSS items carry no category; until GLM classifies them the digest
+// falls back to a source-based one, and the fast breaking loop (which
+// never runs GLM) uses the same mapping for topic filtering.
+function fallbackCategory(source) {
+  return source === 'The Verge' ? 'TECH' : 'WORLD'
+}
+
+// Alert recipients: chats with alerts on, narrowed to chats whose chosen
+// topics include the story's category. Empty or unset topics = all topics.
+export function topicRecipients(category, chats = state.chats, preferences = state.preferences) {
+  return chats.filter(id => {
+    const prefs = preferences[id]
+    if (prefs?.alerts === false) return false
+    const topics = prefs?.topics
+    return !Array.isArray(topics) || topics.length === 0 || (typeof category === 'string' && topics.includes(category))
+  })
+}
+
 function limitText(text, words, chars) {
   return typeof text === 'string' ? text.trim().split(/\s+/).slice(0, words).join(' ').slice(0, chars) : ''
 }
@@ -275,7 +294,7 @@ function buildDigest(candidates, rewritten, breaking) {
       id: `s${createHash('sha256').update(c.url).digest('hex').slice(0, 12)}`,
       headline: limitText(s?.headline, 10, 120) || limitText(c.title, 10, 120),
       summary: limitText(s?.summary, 18, 220),
-      category: CATEGORIES.includes(s?.category) ? s.category : c.source === 'The Verge' ? 'TECH' : 'WORLD',
+      category: CATEGORIES.includes(s?.category) ? s.category : fallbackCategory(c.source),
       source: c.source,
       url: c.url,
       published: c.published,
@@ -322,16 +341,44 @@ async function runRefresh(reason) {
   state.updatedAt = new Date().toISOString()
   const now = Date.now()
   state.alerts = state.alerts.filter(alert => now - alert.at < ALERT_HISTORY_MS)
-  const recipients = state.chats.filter(id => state.preferences[id]?.alerts !== false)
+  const lead = state.digest[0]
+  const recipients = topicRecipients(lead?.category)
   if (breaking && recipients.length && shouldAlert(breaking, state.alerts, now)) {
     state.alerts.push({ title: breaking.title, url: breaking.url, at: now })
     persist()
-    const lead = state.digest[0]
     void sendToChats(`🚨 Breaking news\n${lead.headline}\n${lead.source}: ${lead.url}`, recipients)
   } else {
     persist()
   }
   return true
+}
+
+// Fast breaking-only ingest: the same RSS fetch + detectBreaking + alert
+// send as the digest flow, every FAST_REFRESH_MS, with no GLM call —
+// digest contents stay owned by the 30-minute flow. It shares the alert
+// history and shouldAlert with runRefresh, so no story alerts twice.
+let fastInProgress
+export function fastBreakingCheck() {
+  fastInProgress ??= runFastBreaking().finally(() => { fastInProgress = undefined })
+  return fastInProgress
+}
+async function runFastBreaking() {
+  if (refreshInProgress) return false // a digest refresh is in flight and covers alerts
+  try {
+    const breaking = detectBreaking((await Promise.all(FEEDS.map(fetchFeed))).flat())
+    if (!breaking) return false
+    const now = Date.now()
+    state.alerts = state.alerts.filter(alert => now - alert.at < ALERT_HISTORY_MS)
+    const recipients = topicRecipients(fallbackCategory(breaking.source))
+    if (!recipients.length || !shouldAlert(breaking, state.alerts, now)) return false
+    state.alerts.push({ title: breaking.title, url: breaking.url, at: now })
+    persist()
+    void sendToChats(`🚨 Breaking news\n${breaking.title}\n${breaking.source}: ${breaking.url}`, recipients)
+    return true
+  } catch (e) {
+    console.error('[breaking] fast check failed:', e.message)
+    return false
+  }
 }
 
 // ---------- Telegram bot ----------
@@ -893,5 +940,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   server.listen(PORT, '0.0.0.0', () => console.log(`[headsup] listening on :${PORT}`))
   refreshDigest('startup')
   setInterval(() => refreshDigest('scheduled'), REFRESH_MS)
+  setInterval(() => void fastBreakingCheck(), FAST_REFRESH_MS)
   pollLoop()
 }
