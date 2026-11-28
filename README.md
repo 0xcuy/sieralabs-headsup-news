@@ -11,6 +11,10 @@ firehose of headlines is unreadable, and reading without acting is a dead
 end. People miss the day's important stories because checking the news
 means stopping what they're doing and pulling out a phone.
 
+## Why glanceable
+
+Most people don't want the full article — they want to know *what happened*, fast. A one-sentence summary lets you catch the point in seconds, without information overload, and on glasses there's no other option: the 576×288 display can't show long text, and the whole point is staying connected to the real world instead of staring at a phone. Heads Up News doesn't remove full news — every story can be saved to Telegram and read properly later. The summary is the filter; the save is the bridge.
+
 ## What it does
 
 **Heads Up News** is an AI-agent news digest that lives in two places:
